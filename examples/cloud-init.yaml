@@ -1,0 +1,60 @@
+#cloud-config
+# dnslb 节点 user-data 示例模板（Ubuntu）。{{...}} 占位符由控制器在建机时替换。
+# 这里只演示安装 Grafana Alloy 上报带 node_id 标签的指标，应用和证书部署请换成你自己的流程。
+
+package_update: true
+packages:
+  - curl
+  - gpg
+
+write_files:
+  - path: /etc/dnslb/config.alloy
+    permissions: '0640'
+    content: |
+      prometheus.exporter.unix "node" { }
+
+      prometheus.scrape "node" {
+        targets         = prometheus.exporter.unix.node.targets
+        forward_to      = [prometheus.relabel.labels.receiver]
+        scrape_interval = "15s"
+      }
+
+      // 给所有指标加上 node_id / service / pool 标签，控制器按 node_id 聚合
+      prometheus.relabel "labels" {
+        forward_to = [prometheus.remote_write.grafana.receiver]
+        rule {
+          target_label = "node_id"
+          replacement  = "{{node_id}}"
+        }
+        rule {
+          target_label = "service"
+          replacement  = "{{service}}"
+        }
+        rule {
+          target_label = "pool"
+          replacement  = "{{pool}}"
+        }
+      }
+
+      prometheus.remote_write "grafana" {
+        endpoint {
+          url = "{{grafana_remote_write_url}}"
+          basic_auth {
+            username = "{{grafana_username}}"
+            password = "{{grafana_write_token}}"
+          }
+        }
+      }
+
+runcmd:
+  # 安装 Grafana Alloy
+  - mkdir -p /etc/apt/keyrings
+  - curl -fsSL https://apt.grafana.com/gpg.key | gpg --dearmor -o /etc/apt/keyrings/grafana.gpg
+  - echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" > /etc/apt/sources.list.d/grafana.list
+  - apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y alloy
+  - install -m 0640 -g alloy /etc/dnslb/config.alloy /etc/alloy/config.alloy
+  - systemctl enable alloy
+  - systemctl restart alloy
+  # 部署应用、从证书中心拉取证书（替换成你的实际流程）。健康检查路径通过后节点才会加入 DNS
+  - curl -fsSL "{{cert_center_url}}/bootstrap.sh" | bash -s -- --node "{{node_id}}" --pool "{{pool}}"

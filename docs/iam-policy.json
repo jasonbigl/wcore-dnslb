@@ -1,0 +1,95 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "Route53ManageZone",
+            "Effect": "Allow",
+            "Action": [
+                "route53:GetHostedZone",
+                "route53:ListResourceRecordSets",
+                "route53:ChangeResourceRecordSets"
+            ],
+            "Resource": "arn:aws:route53:::hostedzone/ZONE_ID"
+        },
+        {
+            "Sid": "Route53Changes",
+            "Effect": "Allow",
+            "Action": [
+                "route53:GetChange",
+                "route53:TestDNSAnswer"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "Ec2Read",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:DescribeInstances",
+                "ec2:DescribeImages",
+                "ec2:DescribeSubnets"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "Ec2LaunchResources",
+            "Effect": "Allow",
+            "Action": "ec2:RunInstances",
+            "Resource": [
+                "arn:aws:ec2:*::image/*",
+                "arn:aws:ec2:*:ACCOUNT_ID:subnet/*",
+                "arn:aws:ec2:*:ACCOUNT_ID:security-group/*",
+                "arn:aws:ec2:*:ACCOUNT_ID:network-interface/*",
+                "arn:aws:ec2:*:ACCOUNT_ID:key-pair/*",
+                "arn:aws:ec2:*:ACCOUNT_ID:volume/*"
+            ]
+        },
+        {
+            "Sid": "Ec2LaunchOnlyTaggedInstances",
+            "Effect": "Allow",
+            "Action": "ec2:RunInstances",
+            "Resource": "arn:aws:ec2:*:ACCOUNT_ID:instance/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:RequestTag/dnslb:service": "SERVICE"
+                }
+            }
+        },
+        {
+            "Sid": "Ec2TagOnLaunch",
+            "Effect": "Allow",
+            "Action": "ec2:CreateTags",
+            "Resource": [
+                "arn:aws:ec2:*:ACCOUNT_ID:instance/*",
+                "arn:aws:ec2:*:ACCOUNT_ID:volume/*"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "ec2:CreateAction": "RunInstances"
+                }
+            }
+        },
+        {
+            "Sid": "Ec2TerminateOnlyOwnInstances",
+            "Effect": "Allow",
+            "Action": "ec2:TerminateInstances",
+            "Resource": "arn:aws:ec2:*:ACCOUNT_ID:instance/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/dnslb:service": "SERVICE"
+                }
+            }
+        },
+        {
+            "Sid": "SesSend",
+            "Effect": "Allow",
+            "Action": "ses:SendEmail",
+            "Resource": "arn:aws:ses:SES_REGION:ACCOUNT_ID:identity/*"
+        },
+        {
+            "Sid": "SesAccountStatus",
+            "Effect": "Allow",
+            "Action": "ses:GetAccount",
+            "Resource": "*"
+        }
+    ]
+}

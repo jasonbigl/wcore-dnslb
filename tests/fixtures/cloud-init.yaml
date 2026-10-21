@@ -1,0 +1,11 @@
+#cloud-config
+# 测试用模板：只使用内置占位符
+write_files:
+  - path: /etc/dnslb-node
+    content: |
+      node_id={{node_id}}
+      service={{service}}
+      pool={{pool}}
+      provider={{provider}}
+      region={{region}}
+      latency_region={{ latency_region }}
