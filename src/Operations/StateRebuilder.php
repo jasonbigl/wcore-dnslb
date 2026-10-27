@@ -42,6 +42,23 @@ final class StateRebuilder
                 }
             }
         }
+
+        $serving = count(array_filter($result->restored, static function (Node $node): bool {
+            return $node->state === Node::IN_SERVICE;
+        }));
+        $this->app->eventRecorder()->info('state_rebuilt', sprintf(
+            '重建状态库：补充 %d 个节点（%d 个在线，%d 个按排空处理）%s%s',
+            count($result->restored),
+            $serving,
+            count($result->restored) - $serving,
+            $result->warnings === [] ? '' : '，' . count($result->warnings) . ' 条需要确认',
+            $result->complete ? '' : '；部分云厂商的实例未能列出，结果不完整'
+        ), null, null, [
+            'nodes' => array_map(static function (Node $node): string {
+                return $node->nodeId;
+            }, $result->restored),
+            'warnings' => $result->warnings,
+        ]);
         return $result;
     }
 

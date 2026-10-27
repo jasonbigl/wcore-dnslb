@@ -9,6 +9,7 @@ use Wcore\Dnslb\Config\Config;
 use Wcore\Dnslb\Dns\CloudflareSync;
 use Wcore\Dnslb\Dns\DnsSync;
 use Wcore\Dnslb\Dns\EmptyPublishGuard;
+use Wcore\Dnslb\Dns\ForeignRecordTracker;
 use Wcore\Dnslb\Dns\NodeSelector;
 use Wcore\Dnslb\Dns\Route53Planner;
 use Wcore\Dnslb\Dns\Route53Sync;
@@ -161,21 +162,34 @@ final class Application
         return $this->instances[NodeSelector::class] ??= new NodeSelector($this->config, $this->nodes(), $this->pools());
     }
 
+    public function foreignRecords(): ForeignRecordTracker
+    {
+        return $this->instances[ForeignRecordTracker::class] ??= new ForeignRecordTracker(
+            $this->config->dns->name,
+            $this->meta(),
+            $this->eventRecorder(),
+            $this->clock(),
+            $this->logger()
+        );
+    }
+
     /**
      * 按 dns.provider 选择 Route53Sync 或 CloudflareSync。
      */
     public function dnsSync(): DnsSync
     {
         if (!isset($this->instances[DnsSync::class])) {
-            $guard = new EmptyPublishGuard($this->config->dns->name, $this->meta(), $this->eventRecorder(), $this->clock(), $this->logger());
+            $guard = new EmptyPublishGuard($this->config, $this->nodes(), $this->meta(), $this->eventRecorder(), $this->clock(), $this->logger());
+            $foreign = $this->foreignRecords();
             $this->instances[DnsSync::class] = $this->config->dns->isCloudflare()
-                ? new CloudflareSync($this->config, $this->cloudflare(), $this->nodeSelector(), $this->lock('dns'), $guard, $this->clock(), $this->logger())
+                ? new CloudflareSync($this->config, $this->cloudflare(), $this->nodeSelector(), $this->lock('dns'), $guard, $foreign, $this->clock(), $this->logger())
                 : new Route53Sync(
                     $this->config,
                     $this->route53(),
                     new Route53Planner($this->config, $this->nodeSelector()),
                     $this->lock('dns'),
                     $guard,
+                    $foreign,
                     $this->clock(),
                     $this->logger()
                 );
@@ -195,6 +209,7 @@ final class Application
             $this->prober(),
             $this->nodes(),
             $this->pools(),
+            $this->nodeSelector(),
             $this->meta(),
             $this->eventRecorder(),
             $this->clock(),
@@ -252,6 +267,7 @@ final class Application
             $this->nodes(),
             $this->pools(),
             $this->dnsSync(),
+            $this->foreignRecords(),
             $this->eventRecorder(),
             $this->clock(),
             $this->logger(),
@@ -305,6 +321,7 @@ final class Application
             $this->provisioner(),
             $this->reconciler(),
             $this->eventRecorder(),
+            $this->meta(),
             $this->clock(),
             $this->logger()
         );

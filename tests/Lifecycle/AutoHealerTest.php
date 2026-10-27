@@ -141,6 +141,31 @@ final class AutoHealerTest extends TestCase
         self::assertSame(['autoheal_systemic'], $this->t->eventTypes());
     }
 
+    public function testSingleServingNodeIsReplacedWhileTwoFailingNodesAreSystemic(): void
+    {
+        $this->servingNodes(1);
+        $this->unhealthy('web-tokyo-0', 'v4', 300);
+
+        $this->heal();
+
+        self::assertSame(Node::REPLACING, $this->t->node('web-tokyo-0')->state, '1/1 is not treated as a systemic failure');
+        self::assertCount(1, $this->aws->callsMatching('create'));
+
+        $t = new TestApp(['autoheal' => ['unhealthy_for' => 300]]);
+        $t->app->providers()->set('aws', $this->aws);
+        foreach (['a', 'b'] as $i => $suffix) {
+            $t->addNode("web-tokyo-{$suffix}", 'tokyo', Node::IN_SERVICE, "10.0.0.{$i}");
+            $node = $t->node("web-tokyo-{$suffix}");
+            $node->v4->healthy = false;
+            $node->v4->since = $t->clock->now() - 900;
+            $t->app->nodes()->saveHealth($node);
+        }
+        $t->app->autoHealer()->run([]);
+
+        self::assertCount(1, $this->aws->callsMatching('create'), 'two of two unhealthy is still systemic');
+        self::assertSame(['autoheal_systemic'], $t->eventTypes());
+    }
+
     public function testHourlyLimit(): void
     {
         $this->servingNodes(8);

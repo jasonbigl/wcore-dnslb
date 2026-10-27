@@ -53,14 +53,14 @@ final class HealthCheckerTest extends TestCase
         self::assertFalse($node->v4->healthy);
         self::assertTrue($node->v6->healthy, 'IPv6 is tracked separately');
         self::assertSame('unexpected HTTP status 503', $node->v4->error);
-        self::assertSame(['node_unhealthy'], $this->t->eventTypes());
+        self::assertSame(['node_unhealthy: 节点 IPv4 连续 2 次健康检查失败，从 DNS 摘除：unexpected HTTP status 503'], $this->events());
 
         unset($this->t->network->status['10.0.0.1']);
         $this->round();
         $this->round();
         self::assertTrue($this->t->node('web-tokyo-a')->v4->healthy);
         self::assertNull($this->t->node('web-tokyo-a')->v4->error);
-        self::assertSame(['node_unhealthy', 'node_recovered'], $this->t->eventTypes());
+        self::assertSame('node_recovered: 节点 IPv4 健康检查恢复，重新加入 DNS', $this->events()[1]);
     }
 
     public function testCanaryDownIgnoresResultsOfThatFamily(): void
@@ -112,6 +112,34 @@ final class HealthCheckerTest extends TestCase
         self::assertSame(1, $this->t->node('web-tokyo-a')->v4->fails, '1 of 3 failing (33%) is below the threshold');
     }
 
+    public function testSingleServingNodeIsNotFrozenButTwoFailingNodesAre(): void
+    {
+        $this->t->addNode('web-tokyo-a', 'tokyo', Node::IN_SERVICE, '10.0.0.1', null);
+        $this->t->network->unreachable = ['10.0.0.1' => true];
+
+        $this->round();
+        $summary = $this->round();
+
+        self::assertSame([], $summary->frozenFamilies, '1/1 is 100% by definition, so the ratio means nothing');
+        self::assertFalse($this->t->node('web-tokyo-a')->v4->healthy);
+        self::assertSame([
+            'node_unhealthy: 节点 IPv4 连续 2 次健康检查失败，但没有健康的节点可以承接，暂时保留在 DNS 中：GET https://app.example.com:443/health: Failed to connect to 10.0.0.1',
+            'pool_down: 池内全部 1 个在线节点 IPv4 均不健康，没有其他池可以承接，暂时保留在 DNS 中',
+        ], $this->events());
+
+        $this->t->network->unreachable = [];
+        $this->round();
+        $this->round();
+        self::assertSame('node_recovered: 节点 IPv4 健康检查恢复（故障期间一直保留在 DNS 中）', $this->events()[2]);
+
+        $this->t->addNode('web-tokyo-b', 'tokyo', Node::IN_SERVICE, '10.0.0.2', null);
+        $this->t->network->unreachable = ['10.0.0.1' => true, '10.0.0.2' => true];
+        $summary = $this->round();
+
+        self::assertSame(['v4'], $summary->frozenFamilies, 'with two nodes both failing at once it still looks systemic');
+        self::assertTrue($this->t->node('web-tokyo-b')->v4->healthy);
+    }
+
     public function testFlagsOfFamiliesNoLongerProbedAreCleared(): void
     {
         $t = new TestApp(['dns' => ['ipv6' => false]]);
@@ -142,7 +170,10 @@ final class HealthCheckerTest extends TestCase
         self::assertSame($downAt, $tokyo->downSince('v4'));
         self::assertNull($tokyo->downSince('v6'));
         self::assertNull($this->t->app->pools()->get('frankfurt')->downSince('v4'));
-        self::assertSame(['node_unhealthy', 'pool_down'], $this->t->eventTypes());
+        self::assertSame([
+            'node_unhealthy: 节点 IPv4 连续 2 次健康检查失败，整池故障宽限期内暂时保留在 DNS 中：GET https://app.example.com:443/health: Failed to connect to 10.0.0.1',
+            'pool_down: 池内全部 1 个在线节点 IPv4 均不健康，若 180 秒内未恢复，将把该区域从 DNS 撤下，流量转到其他区域',
+        ], $this->events());
 
         $this->t->clock->advance(30);
         $this->round();
@@ -153,6 +184,29 @@ final class HealthCheckerTest extends TestCase
         $this->round();
         self::assertNull($this->t->app->pools()->get('tokyo')->downSince('v4'));
         self::assertSame(['node_unhealthy', 'pool_down', 'node_recovered', 'pool_recovered'], $this->t->eventTypes());
+        self::assertSame('node_recovered: 节点 IPv4 健康检查恢复（故障期间一直保留在 DNS 中）', $this->events()[2], 'recovered within pool_failover_after');
+    }
+
+    public function testCloudflareWithdrawsAFailedPoolAtOnce(): void
+    {
+        $this->t = new TestApp(['dns' => ['ipv6' => false]], true);
+        $this->t->addNode('web-tokyo-a', 'tokyo', Node::IN_SERVICE, '10.0.0.1');
+        $this->t->addNode('web-fra-a', 'frankfurt', Node::IN_SERVICE, '10.0.1.1');
+        $this->t->addNode('web-fra-b', 'frankfurt', Node::IN_SERVICE, '10.0.1.2');
+        $this->t->network->unreachable['10.0.0.1'] = true;
+
+        $this->round();
+        $this->round();
+
+        self::assertSame([
+            'node_unhealthy: 节点 IPv4 连续 2 次健康检查失败，从 DNS 摘除：GET https://app.example.com:443/health: Failed to connect to 10.0.0.1',
+            'pool_down: 池内全部 1 个在线节点 IPv4 均不健康，已从 DNS 撤下，由其他池的节点承接',
+        ], $this->events());
+
+        $this->t->network->unreachable = [];
+        $this->round();
+        $this->round();
+        self::assertSame('node_recovered: 节点 IPv4 健康检查恢复，重新加入 DNS', $this->events()[2]);
     }
 
     public function testNodesWithoutIpv6AreProbedOnlyOverIpv4AndOtherStatesAreSkipped(): void
@@ -165,6 +219,16 @@ final class HealthCheckerTest extends TestCase
 
         self::assertSame(1, $summary->targets);
         self::assertSame(['10.0.0.1'], $this->t->network->probed);
+    }
+
+    /**
+     * @return string[] 按时间顺序的 "类型: 内容"
+     */
+    private function events(): array
+    {
+        return array_reverse(array_map(static function ($event): string {
+            return "{$event->type}: {$event->message}";
+        }, $this->t->app->events()->recent(100)));
     }
 
     private function round()

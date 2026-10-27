@@ -120,6 +120,7 @@ final class Route53SyncTest extends TestCase
         self::assertSame(['A web-tokyo-a 10.0.0.1'], $t->records(self::POOL), 'pool records are published ahead of takeover');
         self::assertSame(['A  203.0.113.9'], $t->records('app.example.com'), 'existing record is left alone');
         self::assertNotEmpty($t->logger->matching('Call Dnslb::takeover()'));
+        self::assertSame([], $t->eventTypes(), 'waiting for takeover is not an alert');
 
         $this->expectException(DnsConflictException::class);
         $t->app->dnsSync()->fetchActual();
@@ -153,6 +154,11 @@ final class Route53SyncTest extends TestCase
             'AAAA dnslb-tokyo -> ' . self::POOL,
             'TXT  "keep me"',
         ], $t->records('app.example.com'));
+        self::assertSame(['dns_takeover'], $t->eventTypes(), 'the preview is not recorded');
+        self::assertSame(
+            '接管 app.example.com：删除了 2 条不由 dnslb 管理的记录（AAAA 2001:db8:ffff::9、A 203.0.113.9），解析改由 dnslb 管理',
+            $t->app->events()->recent(1)[0]->message
+        );
         self::assertFalse($t->app->dnsSync()->sync()->takeoverPending);
     }
 
@@ -162,7 +168,8 @@ final class Route53SyncTest extends TestCase
         $t->addNode('web-tokyo-a', 'tokyo', Node::IN_SERVICE, '10.0.0.1');
         $t->app->dnsSync()->sync();
         // 接管后有人把普通 AAAA 记录加了回来
-        $t->network->route53->add(self::simple('app.example.com', 'AAAA', '2001:db8:ffff::9'));
+        $stray = self::simple('app.example.com', 'AAAA', '2001:db8:ffff::9');
+        $t->network->route53->add($stray);
         $t->addNode('web-tokyo-b', 'tokyo', Node::IN_SERVICE, '10.0.0.2');
 
         $result = $t->app->dnsSync()->sync();
@@ -170,7 +177,16 @@ final class Route53SyncTest extends TestCase
         self::assertTrue($result->takeoverPending);
         self::assertSame(['UPSERT A tokyo.pool.app.example.com [web-tokyo-b] 10.0.0.2'], self::describe($result->changes));
         self::assertSame(['A dnslb-tokyo -> ' . self::POOL, 'AAAA  2001:db8:ffff::9'], $t->records('app.example.com'));
+        self::assertSame(['dns_foreign_records'], $t->eventTypes());
+        self::assertStringContainsString('出现了 1 条不由 dnslb 管理的记录（AAAA 2001:db8:ffff::9）', $t->app->events()->recent(1)[0]->message);
+
+        $t->app->dnsSync()->sync();
+        self::assertSame(['dns_foreign_records'], $t->eventTypes(), 'reported once');
         self::assertNotEmpty($t->logger->matching('receive traffic too'));
+
+        unset($t->network->route53->records[$stray->key()]);
+        $t->app->dnsSync()->sync();
+        self::assertSame(['dns_foreign_records', 'dns_foreign_records_removed'], $t->eventTypes());
     }
 
     public function testRenamingAllPoolsKeepsRecordsUntilNewNodesServe(): void
@@ -194,6 +210,7 @@ final class Route53SyncTest extends TestCase
         self::assertSame(['A web-tokyo-a 10.0.0.1'], $t->records(self::POOL));
         self::assertSame(['web-tokyo-a' => true], $t->app->dnsSync()->publishedNodeIds(), 'still in DNS, so its drain timer does not start');
         self::assertSame(['dns_empty_held'], $t->eventTypes(), 'reported once');
+        self::assertStringStartsWith('原有节点所属的池已从配置删除（改名或替换了全部池）', $t->app->events()->recent(1)[0]->message);
 
         $t->addNode('web-ap-tokyo-b', 'ap-tokyo', Node::IN_SERVICE, '10.0.0.2');
         $t->app->dnsSync()->sync();

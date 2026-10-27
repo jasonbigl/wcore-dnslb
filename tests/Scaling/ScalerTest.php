@@ -192,6 +192,35 @@ final class ScalerTest extends TestCase
         self::assertNotEmpty($this->t->logger->matching('connection refused'));
     }
 
+    public function testWarnsAtMostHourlyWhenLoadStaysHighAtMax(): void
+    {
+        $this->serving(['a', 'b', 'c', 'd']);
+        $this->prom->results['cpu'] = ['web-tokyo-a' => 90, 'web-tokyo-b' => 90, 'web-tokyo-c' => 90, 'web-tokyo-d' => 90];
+
+        $this->scale();
+        $this->t->clock->advance(60);
+        $this->scale();
+        self::assertSame([], $this->t->eventTypes(), 'not sustained yet');
+
+        $this->t->clock->advance(60);
+        $this->scale();
+        self::assertSame([], $this->aws->calls);
+        self::assertSame(['scale_at_max'], $this->t->eventTypes());
+        $event = $this->t->app->events()->recent(1)[0];
+        self::assertSame('warning', $event->level);
+        self::assertSame('tokyo', $event->pool);
+        self::assertSame('已达到 max，无法继续扩容：cpu=90 > 70, already at max (4)。负载持续偏高时调大 max 或换用更大的机型', $event->message);
+
+        $this->t->clock->advance(3540);
+        $this->scale();
+        self::assertSame(['scale_at_max'], $this->t->eventTypes(), 'once per hour');
+        self::assertNotEmpty($this->t->logger->matching('Pool tokyo cannot scale out'));
+
+        $this->t->clock->advance(60);
+        $this->scale();
+        self::assertSame(['scale_at_max', 'scale_at_max'], $this->t->eventTypes());
+    }
+
     public function testPausedPoolDoesNotScaleOut(): void
     {
         $this->serving(['a']);

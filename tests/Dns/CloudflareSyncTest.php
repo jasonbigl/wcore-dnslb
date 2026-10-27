@@ -97,9 +97,11 @@ final class CloudflareSyncTest extends TestCase
         self::assertTrue($blocked->takeoverPending);
         self::assertFalse($blocked->hasChanges());
         self::assertSame([], $cloudflare->batches);
+        self::assertSame([], $t->eventTypes(), 'waiting for takeover is not an alert');
 
         $preview = $t->app->dnsSync()->takeover(true);
         self::assertSame([], $cloudflare->batches, 'dry-run only previews');
+        self::assertSame([], $t->eventTypes());
         $start = $t->clock->now();
         $result = $t->app->dnsSync()->takeover();
 
@@ -110,10 +112,16 @@ final class CloudflareSyncTest extends TestCase
         ], $cloudflare->batches, 'new records first, so the name never runs empty');
         self::assertSame(5, $t->clock->now() - $start);
         self::assertSame(['A 10.0.0.1', 'AAAA 2001:db8::1', 'TXT keep me'], self::contents($t));
+        self::assertSame(['dns_takeover'], $t->eventTypes());
+        self::assertSame(
+            '接管 app.example.com：删除了 3 条不由 dnslb 管理的记录（A 203.0.113.9（代理）、AAAA 2001:db8:ffff::9（代理）、A 203.0.113.10（代理）），解析改由 dnslb 管理',
+            $t->app->events()->recent(1)[0]->message
+        );
 
         $after = $t->app->dnsSync()->sync();
         self::assertFalse($after->takeoverPending);
         self::assertFalse($after->hasChanges());
+        self::assertSame(['dns_takeover'], $t->eventTypes());
     }
 
     public function testTakeoverOfCnameDeletesAndCreatesInOneBatch(): void
@@ -147,7 +155,7 @@ final class CloudflareSyncTest extends TestCase
         $a = $t->addNode('web-tokyo-a', 'tokyo', Node::IN_SERVICE, '10.0.0.1');
         $t->addNode('web-tokyo-b', 'tokyo', Node::IN_SERVICE, '10.0.0.2');
         $t->app->dnsSync()->sync();
-        $t->network->cloudflare->add(new DnsRecord('A', self::NAME, '203.0.113.9', true));
+        $stray = $t->network->cloudflare->add(new DnsRecord('A', self::NAME, '203.0.113.9', true));
 
         $a->v4->healthy = false;
         $t->app->nodes()->saveHealth($a);
@@ -155,7 +163,20 @@ final class CloudflareSyncTest extends TestCase
 
         self::assertTrue($result->takeoverPending);
         self::assertSame(['DELETE A app.example.com 10.0.0.1 proxied [dnslb node web-tokyo-a]'], self::describe($result->changes));
+        self::assertSame(['dns_foreign_records'], $t->eventTypes());
+        $event = $t->app->events()->recent(1)[0];
+        self::assertSame('warning', $event->level);
+        self::assertSame('app.example.com 上出现了 1 条不由 dnslb 管理的记录（A 203.0.113.9（代理）），会与节点一起分到流量。确认无用后删除，或调用 Dnslb::takeover() 替换', $event->message);
+
+        $t->app->dnsSync()->sync();
+        self::assertSame(['dns_foreign_records'], $t->eventTypes(), 'reported once');
         self::assertNotEmpty($t->logger->matching('receive traffic too'));
+
+        unset($t->network->cloudflare->records[$stray->id]);
+        $t->clock->advance(120);
+        self::assertFalse($t->app->dnsSync()->sync()->takeoverPending);
+        self::assertSame(['dns_foreign_records', 'dns_foreign_records_removed'], $t->eventTypes());
+        self::assertSame('app.example.com 上不由 dnslb 管理的记录已全部删除（存在了 120 秒）', $t->app->events()->recent(1)[0]->message);
     }
 
     public function testRenamingAllPoolsKeepsRecordsUntilNewNodesServe(): void
@@ -174,12 +195,52 @@ final class CloudflareSyncTest extends TestCase
         self::assertSame([], $held->changes);
         self::assertSame(['A 10.0.0.1'], self::contents($t));
         self::assertSame(['dns_empty_held'], $t->eventTypes());
+        self::assertSame(
+            '原有节点所属的池已从配置删除（改名或替换了全部池），新池还没有可以发布的节点，保留 app.example.com 现有的记录不删除，新池有节点上线后再切换',
+            $t->app->events()->recent(1)[0]->message
+        );
 
         $t->addNode('web-dallas-b', 'dallas', Node::IN_SERVICE, '10.0.0.2');
         $t->app->dnsSync()->sync();
 
         self::assertSame(['A 10.0.0.2'], self::contents($t));
         self::assertSame(['dns_empty_held', 'dns_empty_released'], $t->eventTypes());
+    }
+
+    public function testDecommissioningKeepsTheLastRecordUntilItIsDeletedByHand(): void
+    {
+        $t = new TestApp(['dns' => ['ipv6' => false]], true);
+        $t->addNode('web-tokyo-a', 'tokyo', Node::IN_SERVICE, '10.0.0.1');
+        $t->addNode('web-tokyo-b', 'tokyo', Node::IN_SERVICE, '10.0.0.2');
+        $t->app->dnsSync()->sync();
+
+        $t->app->reconciler()->drain($t->node('web-tokyo-a'), '缩容');
+        self::assertSame('从 DNS 摘除并开始排空（缩容），确认摘除后 1800 秒删除机器', $t->app->events()->recent(1)[0]->message);
+        $t->app->dnsSync()->sync();
+        self::assertSame(['A 10.0.0.2'], self::contents($t));
+
+        $t->app->reconciler()->drain($t->node('web-tokyo-b'), '缩容');
+        self::assertSame(
+            '开始排空（缩容）。没有其他可以发布的节点，DNS 记录暂时保留（见 dns_empty_held），有新节点上线或手动删除记录后才会摘除；确认摘除后 1800 秒删除机器',
+            $t->app->events()->recent(1)[0]->message
+        );
+        $t->app->dnsSync()->sync();
+        self::assertSame(['A 10.0.0.2'], self::contents($t));
+
+        // 下线整个服务：手动删除记录
+        $t->network->cloudflare->records = [];
+        $t->app->dnsSync()->sync();
+
+        self::assertSame(['node_draining', 'node_draining', 'dns_empty_held', 'dns_empty_released'], $t->eventTypes());
+        self::assertSame(
+            '没有在线节点可以发布（例如缩容到 0 台、节点全部丢失），保留 app.example.com 现有的记录不删除，有节点上线后再切换；如果是要下线整个服务，请手动删除这些记录',
+            $t->app->events()->recent(2)[1]->message
+        );
+        self::assertSame(
+            'app.example.com 上保留的记录已被删除，名称下现在没有 dnslb 的记录（仍没有可以发布的节点）',
+            $t->app->events()->recent(1)[0]->message
+        );
+        self::assertSame([], $t->app->dnsSync()->publishedNodeIds(), 'the drain timer can start now');
     }
 
     public function testFailedPoolIsRemovedWithoutGracePeriod(): void

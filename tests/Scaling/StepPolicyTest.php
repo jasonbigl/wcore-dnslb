@@ -80,8 +80,12 @@ final class StepPolicyTest extends TestCase
         self::assertSame(0, $pending->delta);
         self::assertStringContainsString('waiting for 1 starting node', $pending->reason);
         self::assertSame(self::NOW - 600, $pending->outBreachSince, 'timer is kept while blocked');
+        self::assertFalse($pending->atMax);
 
-        self::assertStringContainsString('already at max', $this->decide(5, 0, $hot, $state)->reason);
+        $atMax = $this->decide(5, 0, $hot, $state);
+        self::assertSame('cpu=90 > 70, already at max (5)', $atMax->reason);
+        self::assertTrue($atMax->atMax);
+        self::assertSame(self::NOW - 600, $atMax->outBreachSince);
     }
 
     public function testScaleOutIsCappedByMax(): void

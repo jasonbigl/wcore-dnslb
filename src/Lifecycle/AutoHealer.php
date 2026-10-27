@@ -100,7 +100,8 @@ final class AutoHealer
             return $this->unhealthyFamily($node) !== null;
         });
         $ratio = $serving === [] ? 0.0 : count($unhealthyNow) / count($serving);
-        if ($ratio > $this->config->autoheal->maxUnhealthyRatio) {
+        // 只有 1 台在线节点时不做比例判断：任何故障都是 100%，否则单节点服务永远无法自动修复
+        if (count($serving) > 1 && $ratio > $this->config->autoheal->maxUnhealthyRatio) {
             $this->notice('autoheal_systemic', sprintf(
                 '%d/%d 个在线节点不健康，超过 %d%%，判定为系统性故障，暂停自动替换。请检查应用是否整体故障',
                 count($unhealthyNow),

@@ -16,7 +16,8 @@ use Wcore\Dnslb\Support\Logger;
  * 不区分区域。开启代理（橙云）时，Cloudflare 边缘随机选择节点回源，失败时自动重试其他节点。
  *
  * 由 dnslb 管理的记录用备注 "dnslb node {节点 ID}" 标识。同一名称上已有其他 A / AAAA / CNAME 记录时，
- * 在 takeover 之前不发布任何记录。没有可以发布的节点时保留现有记录（见 EmptyPublishGuard）。
+ * 在 takeover 之前不发布任何记录，接管后又出现时告警（见 ForeignRecordTracker）。
+ * 没有可以发布的节点时保留现有记录（见 EmptyPublishGuard）。
  *
  * 新增 / 修改和删除分两次提交，中间等待传播：Cloudflare 的批量接口在一个事务内先删后增，
  * 但每条记录分别传播到边缘，一起提交时名称下可能短暂没有记录。
@@ -32,6 +33,7 @@ final class CloudflareSync implements DnsSync
     private NodeSelector $selector;
     private FileLock $lock;
     private EmptyPublishGuard $guard;
+    private ForeignRecordTracker $foreign;
     private Clock $clock;
     private Logger $logger;
 
@@ -41,6 +43,7 @@ final class CloudflareSync implements DnsSync
         NodeSelector $selector,
         FileLock $lock,
         EmptyPublishGuard $guard,
+        ForeignRecordTracker $foreign,
         Clock $clock,
         Logger $logger
     ) {
@@ -49,6 +52,7 @@ final class CloudflareSync implements DnsSync
         $this->selector = $selector;
         $this->lock = $lock;
         $this->guard = $guard;
+        $this->foreign = $foreign;
         $this->clock = $clock;
         $this->logger = $logger;
     }
@@ -58,6 +62,8 @@ final class CloudflareSync implements DnsSync
         return $this->lock->synchronized(function () use ($dryRun): SyncResult {
             $desired = $this->plan($this->clock->now());
             [$owned, $foreign] = $this->fetchRecords();
+            // 接管后又出现其他记录时告警（节点记录照常维护，其他记录也会分到流量），消失后记录恢复
+            $this->foreign->observe(self::describeAll($foreign), $owned !== []);
             if ($foreign !== [] && $owned === []) {
                 // 尚未接管：不往别人的记录里混入节点
                 $this->logger->warning(sprintf(
@@ -68,14 +74,6 @@ final class CloudflareSync implements DnsSync
                 $result = new SyncResult([], [], $dryRun);
                 $result->takeoverPending = true;
                 return $result;
-            }
-            if ($foreign !== []) {
-                // 已接管后又出现了其他记录：节点记录照常维护，其他记录也会分到流量
-                $this->logger->warning(sprintf(
-                    '%s also has %d record(s) not managed by dnslb that receive traffic too; remove them or call Dnslb::takeover()',
-                    $this->config->dns->name,
-                    count($foreign)
-                ));
             }
             $result = $this->guard->hold($desired === [], $owned === [])
                 ? new SyncResult([], [], $dryRun)
@@ -106,7 +104,11 @@ final class CloudflareSync implements DnsSync
                 }
             }
             $changes = array_merge(self::diff($desired, $owned), array_map([RecordChange::class, 'delete'], $foreign));
-            return $this->submit($changes, $together, $dryRun);
+            $result = $this->submit($changes, $together, $dryRun);
+            if (!$dryRun && $foreign !== []) {
+                $this->foreign->recordTakeover(self::describeAll($foreign));
+            }
+            return $result;
         });
     }
 
@@ -154,9 +156,7 @@ final class CloudflareSync implements DnsSync
         }
         $items[] = new CheckItem(CheckItem::OK, 'Cloudflare 现有记录', count($owned) . ' 条由 dnslb 管理（' . ($dns->proxied ? '代理' : '仅 DNS') . '）');
         if ($foreign !== []) {
-            $list = implode('、', array_map(static function (DnsRecord $record): string {
-                return "{$record->type} {$record->content}" . ($record->proxied ? '（代理）' : '');
-            }, $foreign));
+            $list = implode('、', self::describeAll($foreign));
             $items[] = new CheckItem(CheckItem::WARN, '待接管的记录', "{$dns->name} 上有 " . count($foreign) . " 条不由 dnslb 管理的记录（{$list}），节点上线后用 Dnslb::takeover() 无中断切换");
         }
         return $items;
@@ -211,6 +211,19 @@ final class CloudflareSync implements DnsSync
             }
         }
         return [$owned, $foreign];
+    }
+
+    /**
+     * 外来记录的描述，例如 "A 203.0.113.9（代理）"。
+     *
+     * @param DnsRecord[] $records
+     * @return string[]
+     */
+    private static function describeAll(array $records): array
+    {
+        return array_map(static function (DnsRecord $record): string {
+            return "{$record->type} {$record->content}" . ($record->proxied ? '（代理）' : '');
+        }, $records);
     }
 
     /**

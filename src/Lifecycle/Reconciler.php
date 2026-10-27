@@ -5,6 +5,7 @@ namespace Wcore\Dnslb\Lifecycle;
 use Wcore\Dnslb\Config\Config;
 use Wcore\Dnslb\Config\PoolConfig;
 use Wcore\Dnslb\Dns\DnsSync;
+use Wcore\Dnslb\Dns\ForeignRecordTracker;
 use Wcore\Dnslb\Metrics\MetricException;
 use Wcore\Dnslb\Metrics\MetricRegistry;
 use Wcore\Dnslb\Notify\EventRecorder;
@@ -44,6 +45,7 @@ final class Reconciler
     private NodeRepository $nodes;
     private PoolRepository $pools;
     private DnsSync $dnsSync;
+    private ForeignRecordTracker $foreignRecords;
     private EventRecorder $events;
     private Clock $clock;
     private Logger $logger;
@@ -67,6 +69,7 @@ final class Reconciler
         NodeRepository $nodes,
         PoolRepository $pools,
         DnsSync $dnsSync,
+        ForeignRecordTracker $foreignRecords,
         EventRecorder $events,
         Clock $clock,
         Logger $logger,
@@ -78,6 +81,7 @@ final class Reconciler
         $this->nodes = $nodes;
         $this->pools = $pools;
         $this->dnsSync = $dnsSync;
+        $this->foreignRecords = $foreignRecords;
         $this->events = $events;
         $this->clock = $clock;
         $this->logger = $logger;
@@ -139,7 +143,24 @@ final class Reconciler
         $when = $drain->idleQuery !== null
             ? "确认摘除后，流量降到阈值以下（至少 {$drain->min} 秒）或 {$drain->max} 秒后删除机器"
             : "确认摘除后 {$drain->max} 秒删除机器";
-        $this->events->info('node_draining', "从 DNS 摘除并开始排空（{$reason}），{$when}", $node->pool, $node->nodeId);
+        $message = $this->hasPublishableNodes()
+            ? "从 DNS 摘除并开始排空（{$reason}），{$when}"
+            // EmptyPublishGuard 不会把对外名称同步成没有记录
+            : "开始排空（{$reason}）。没有其他可以发布的节点，DNS 记录暂时保留（见 dns_empty_held），有新节点上线或手动删除记录后才会摘除；{$when}";
+        $this->events->info('node_draining', $message, $node->pool, $node->nodeId);
+    }
+
+    /**
+     * 配置中的池里是否还有可以发布到 DNS 的节点。
+     */
+    private function hasPublishableNodes(): bool
+    {
+        foreach ($this->nodes->byStates(self::SERVING_STATES) as $node) {
+            if (isset($this->config->pools[$node->pool])) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -307,7 +328,11 @@ final class Reconciler
                 $state->warmupFailures = 0;
                 $this->pools->save($state);
             }
-            $this->events->info('node_in_service', '节点通过健康检查，加入 DNS（从创建到上线 ' . ($now - $node->createdAt) . ' 秒）', $node->pool, $node->nodeId);
+            $age = $now - $node->createdAt;
+            $message = $this->foreignRecords->takeoverPending()
+                ? "节点通过健康检查（从创建到上线 {$age} 秒）。{$this->config->dns->name} 上还有不由 dnslb 管理的记录，调用 Dnslb::takeover() 接管之前不会接到流量"
+                : "节点通过健康检查，加入 DNS（从创建到上线 {$age} 秒）";
+            $this->events->info('node_in_service', $message, $node->pool, $node->nodeId);
             return;
         }
         if ($now - $node->createdAt > $this->config->warmupTimeout) {

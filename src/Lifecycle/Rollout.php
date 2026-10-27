@@ -141,12 +141,14 @@ final class Rollout
         }
         $remaining = $this->remaining($state->pool);
         if ($remaining === []) {
-            $this->finish($state);
-            $this->events->info('rollout_completed', sprintf(
+            // finish() 会清空发布进度，先拼好消息
+            $message = sprintf(
                 '发布完成：%d 台旧节点已全部下线，用时 %d 分钟',
                 $state->rolloutTotal,
                 (int) round(($now - (int) $state->rolloutStartedAt) / 60)
-            ), $state->pool);
+            );
+            $this->finish($state);
+            $this->events->info('rollout_completed', $message, $state->pool);
             return;
         }
         if ($state->manualPaused) {

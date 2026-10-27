@@ -3,6 +3,7 @@
 namespace Wcore\Dnslb\Tests\Notify;
 
 use PHPUnit\Framework\TestCase;
+use Wcore\Dnslb\State\Node;
 use Wcore\Dnslb\Tests\Support\TestApp;
 
 final class NotifierTest extends TestCase
@@ -86,6 +87,108 @@ final class NotifierTest extends TestCase
         $events->critical('pool_down', '池 tokyo IPv4 仍然全部不健康', 'tokyo');
         $notifier->flush();
         self::assertCount(3, $this->t->network->emails);
+    }
+
+    public function testEveryAlertGetsItsRecoveryWithinTheThrottleWindow(): void
+    {
+        $events = $this->t->app->eventRecorder();
+        $notifier = $this->t->app->notifier();
+        // 实测：一小时内第二次恢复被自身限频丢弃，告警键没有清除，第三次故障也不发
+        foreach (['held', 'released', 'held', 'released', 'held', 'released'] as $i => $step) {
+            if ($step === 'held') {
+                $events->critical('dns_empty_held', "保留记录 {$i}");
+            } else {
+                $events->info('dns_empty_released', "恢复同步 {$i}");
+            }
+            $notifier->flush();
+            $this->t->clock->advance(180);
+        }
+
+        self::assertCount(6, $this->t->network->emails);
+        foreach ($this->t->network->emails as $i => $email) {
+            self::assertStringContainsString((string) $i, $email['Content']['Simple']['Body']['Text']['Data']);
+        }
+        self::assertNull($this->t->app->alertLog()->lastSentAt('dns_empty_held||'), 'recovered: the next incident alerts at once');
+    }
+
+    public function testRecoveryIsOnlySentForAlertsThatWereSent(): void
+    {
+        $events = $this->t->app->eventRecorder();
+        $notifier = $this->t->app->notifier();
+        $events->info('pool_recovered', '池 tokyo IPv4 已恢复', 'tokyo');
+        $events->info('canary_recovered', '探测机网络已恢复');
+        $notifier->flush();
+        self::assertSame([], $this->t->network->emails, 'no alert was sent, so there is nothing to recover');
+
+        $events->critical('pool_down', '池 tokyo IPv4 全部不健康', 'tokyo');
+        $notifier->flush();
+        $this->t->clock->advance(60);
+        $events->info('pool_recovered', '池 frankfurt IPv4 已恢复', 'frankfurt');
+        $events->info('pool_recovered', '池 tokyo IPv4 已恢复', 'tokyo');
+        $events->info('pool_recovered', '池 tokyo IPv4 再次恢复', 'tokyo');
+        $notifier->flush();
+
+        self::assertCount(2, $this->t->network->emails);
+        $body = $this->t->network->emails[1]['Content']['Simple']['Body']['Text']['Data'];
+        self::assertStringContainsString('池 tokyo IPv4 已恢复', $body);
+        self::assertStringNotContainsString('frankfurt', $body, 'paired per pool');
+        self::assertStringNotContainsString('再次恢复', $body, 'one recovery per alert');
+        self::assertStringNotContainsString('限频期内', $body);
+    }
+
+    public function testAlertsAndRecoveriesInOneEmailArePairedInOrder(): void
+    {
+        $events = $this->t->app->eventRecorder();
+        $events->critical('global_freeze', '冻结 1');
+        $events->info('global_freeze_lifted', '解除 1');
+        $events->critical('global_freeze', '冻结 2');
+        $events->critical('global_freeze', '冻结 2 仍在');
+        $this->t->app->notifier()->flush();
+
+        $body = $this->t->network->emails[0]['Content']['Simple']['Body']['Text']['Data'];
+        foreach (['冻结 1', '解除 1', '冻结 2', '冻结 2 仍在'] as $message) {
+            self::assertStringContainsString($message, $body);
+        }
+        self::assertSame($this->t->clock->now(), $this->t->app->alertLog()->lastSentAt('global_freeze||'), 'still frozen');
+
+        $this->t->clock->advance(60);
+        $events->info('global_freeze_lifted', '解除 2');
+        $this->t->app->notifier()->flush();
+        self::assertCount(2, $this->t->network->emails);
+        self::assertNull($this->t->app->alertLog()->lastSentAt('global_freeze||'));
+    }
+
+    public function testNodeFailureAndRecoveryAreBothEmailedEveryTime(): void
+    {
+        foreach (['a' => '10.0.0.1', 'b' => '10.0.0.2', 'c' => '10.0.0.3'] as $suffix => $ip) {
+            $this->t->addNode("web-tokyo-{$suffix}", 'tokyo', Node::IN_SERVICE, $ip);
+        }
+        $health = $this->t->app->healthChecker();
+        $notifier = $this->t->app->notifier();
+        // 同一节点在限频期内故障、恢复两次
+        for ($cycle = 0; $cycle < 2; $cycle++) {
+            $this->t->network->status['10.0.0.1'] = 503;
+            for ($i = 0; $i < 2; $i++) {
+                $health->runRound();
+                $this->t->clock->advance(10);
+            }
+            $notifier->flush();
+            unset($this->t->network->status['10.0.0.1']);
+            for ($i = 0; $i < 2; $i++) {
+                $health->runRound();
+                $this->t->clock->advance(10);
+            }
+            $notifier->flush();
+        }
+
+        $subjects = array_map(static function (array $email): string {
+            return $email['Content']['Simple']['Subject']['Data'];
+        }, $this->t->network->emails);
+        self::assertCount(4, $subjects);
+        self::assertStringStartsWith('[dnslb:web] WARNING 节点 IPv4 连续 2 次健康检查失败，从 DNS 摘除', $subjects[0]);
+        self::assertSame('[dnslb:web] RECOVERY 节点 IPv4 健康检查恢复，重新加入 DNS', $subjects[1]);
+        self::assertSame([$subjects[0], $subjects[1]], [$subjects[2], $subjects[3]]);
+        self::assertNull($this->t->app->alertLog()->lastSentAt('node_unhealthy|tokyo|web-tokyo-a'));
     }
 
     public function testFailedSendIsRetriedNextTime(): void

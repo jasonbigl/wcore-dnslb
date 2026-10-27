@@ -14,7 +14,8 @@ use Wcore\Dnslb\Support\Logger;
 /**
  * 把 Route 53 同步到 Route53Planner 计算出的期望状态（按延迟就近选择池，池内多值 / 加权）。
  *
- * 在锁内重新读取数据库计算期望记录，再读取 Route 53 实际记录，只提交差异。没有可以发布的节点时保留现有记录（见 EmptyPublishGuard）。
+ * 在锁内重新读取数据库计算期望记录，再读取 Route 53 实际记录，只提交差异。没有可以发布的节点时保留现有记录（见 EmptyPublishGuard），
+ * 接管后对外域名上又出现其他记录时告警（见 ForeignRecordTracker）。
  *
  * 只管理以下记录：
  * - dns.name 下 SetIdentifier 以 "dnslb-" 开头的 latency Alias 记录；
@@ -30,6 +31,7 @@ final class Route53Sync implements DnsSync
     private Route53Planner $planner;
     private FileLock $lock;
     private EmptyPublishGuard $guard;
+    private ForeignRecordTracker $foreign;
     private Clock $clock;
     private Logger $logger;
 
@@ -39,6 +41,7 @@ final class Route53Sync implements DnsSync
         Route53Planner $planner,
         FileLock $lock,
         EmptyPublishGuard $guard,
+        ForeignRecordTracker $foreign,
         Clock $clock,
         Logger $logger
     ) {
@@ -47,6 +50,7 @@ final class Route53Sync implements DnsSync
         $this->planner = $planner;
         $this->lock = $lock;
         $this->guard = $guard;
+        $this->foreign = $foreign;
         $this->clock = $clock;
         $this->logger = $logger;
     }
@@ -65,6 +69,8 @@ final class Route53Sync implements DnsSync
                     break;
                 }
             }
+            // 接管后又出现其他记录时告警（latency 记录照常维护，其他记录也会分到流量），消失后记录恢复
+            $this->foreign->observe(self::describeAll($foreign), $latencyPublished);
             if ($foreign !== [] && !$latencyPublished) {
                 // 尚未接管：对外域名上还有其他记录，只同步池记录，latency 记录等待 takeover
                 $desired = array_filter($desired, static function (RecordSet $r) use ($name): bool {
@@ -72,13 +78,6 @@ final class Route53Sync implements DnsSync
                 });
                 $this->logger->warning(sprintf(
                     '%s has %d record(s) not managed by dnslb; only pool records are synced. Call Dnslb::takeover() to switch over',
-                    $name,
-                    count($foreign)
-                ));
-            } elseif ($foreign !== []) {
-                // 已接管后又出现了其他记录：latency 记录照常维护，其他记录也会分到流量
-                $this->logger->warning(sprintf(
-                    '%s also has %d record(s) not managed by dnslb that receive traffic too; remove them or call Dnslb::takeover()',
                     $name,
                     count($foreign)
                 ));
@@ -131,7 +130,11 @@ final class Route53Sync implements DnsSync
             $deletes = array_map([Change::class, 'delete'], $foreign);
             $changes = array_merge(array_slice($changes, 0, $firstLatency), $deletes, array_slice($changes, $firstLatency));
 
-            return $this->submit($changes, $dryRun);
+            $result = $this->submit($changes, $dryRun);
+            if (!$dryRun && $foreign !== []) {
+                $this->foreign->recordTakeover(self::describeAll($foreign));
+            }
+            return $result;
         });
     }
 
@@ -175,9 +178,7 @@ final class Route53Sync implements DnsSync
         }
         $items[] = new CheckItem(CheckItem::OK, 'Route 53 现有记录', count($owned) . ' 条由 dnslb 管理');
         if ($foreign !== []) {
-            $list = implode('、', array_map(static function (RecordSet $record): string {
-                return $record->type . ' ' . ($record->aliasTarget !== null ? '-> ' . $record->aliasTarget->dnsName : implode(',', $record->values));
-            }, $foreign));
+            $list = implode('、', self::describeAll($foreign));
             $items[] = new CheckItem(CheckItem::WARN, '待接管的记录', "{$dns->name} 上有 " . count($foreign) . " 条不由 dnslb 管理的记录（{$list}），节点上线后用 Dnslb::takeover() 无中断切换");
         }
         return $items;
@@ -341,6 +342,19 @@ final class Route53Sync implements DnsSync
         }
 
         return array_merge(...array_values($phases));
+    }
+
+    /**
+     * 外来记录的描述，例如 "A 203.0.113.9"、"CNAME -> old.example.net"。
+     *
+     * @param RecordSet[] $records
+     * @return string[]
+     */
+    private static function describeAll(array $records): array
+    {
+        return array_map(static function (RecordSet $record): string {
+            return $record->type . ' ' . ($record->aliasTarget !== null ? '-> ' . $record->aliasTarget->dnsName : implode(',', $record->values));
+        }, $records);
     }
 
     private static function isAddressType(RecordSet $record): bool

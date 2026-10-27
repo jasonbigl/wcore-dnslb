@@ -108,6 +108,7 @@ $lb->takeover();                                      // 替换现有记录，�
 - Route 53：删除旧记录和创建 latency 记录在同一个原子批次中完成。
 - 未开启 IPv6（`dns.ipv6 = false`）时，旧的 AAAA 记录也会被删除：保留的话双栈客户端会优先走 IPv6，继续访问旧服务器。之后只有纯 IPv6 的客户端无法访问（Cloudflare 代理模式下边缘本身提供 IPv6，不受影响）。预览时请确认要删除的记录。
 - Cloudflare：先添加节点记录，等待几秒传播后再删除旧的 A / AAAA 记录，期间新旧记录一起轮询。旧记录是 CNAME 时（不能与 A 记录并存）只能在同一批次中先删后增，各边缘节点可能有几秒不一致。
+- 接管后记录 `dns_takeover` 事件。之后名称下又出现不由 dnslb 管理的记录时（它们会与节点一起分到流量），发出一次 `dns_foreign_records` 告警，删除后收到恢复通知。
 
 ### 6. 监控控制器本身
 
@@ -142,7 +143,7 @@ $lb = Dnslb::fromConfigFile('/etc/dnslb/web.php', ['logger' => $psrLogger]);   /
 | `rollout(?string $pool = null, int $batch = 1, bool $dryRun = false)` | `RolloutResult` | 发布新版本：用新机器逐台替换现有节点，由之后的 tick 逐步完成（见下方「发布新版本」）。`nodes` 为池 => 待替换节点，`warnings` 为需要注意的情况 |
 | `cancelRollout(?string $pool = null)` | — | 停止发布；已开始的替换继续完成，其余旧节点保持不变 |
 | `pause(?string $pool = null)` / `resume(?string $pool = null)` | — | 暂停 / 恢复自动增删机器（维护时用；健康检查和 DNS 摘除照常）。`resume` 同时解除连续启动失败造成的自动暂停；`$pool` 为 null 时作用于所有池 |
-| `rebuildState(bool $dryRun = false)` | `RebuildResult` | 状态库丢失后，根据云上实例和 DNS 记录重建。`restored` 为恢复的节点，`warnings` 为需要确认的情况 |
+| `rebuildState(bool $dryRun = false)` | `RebuildResult` | 状态库丢失后，根据云上实例和 DNS 记录重建，并记录 `state_rebuilt` 事件。`restored` 为恢复的节点，`warnings` 为需要确认的情况 |
 | `cleanupOrphans(bool $dryRun = true)` | `OrphanCleanupResult` | 删除孤儿实例：云上带本服务标签、但连续 15 分钟没有节点引用的实例（tick 每 10 分钟检查并告警，`status()` 的 `orphans` 中列出）。**默认只预览**，`orphans` 为孤儿列表；传 false 删除，`terminated` / `failed` 为结果。状态库从备份恢复后先 `rebuildState()`，不要直接删除 |
 | `app()` | `Application` | 底层组件（高级用法），例如 `$lb->app()->nodes()->live()` |
 
@@ -293,19 +294,19 @@ if ($preview->orphans !== [] && $this->confirm('确认删除这些实例？')) {
 | `dns.proxied` | true | 仅 Cloudflare。`true`：代理（橙云）；`false`：仅 DNS（灰云） |
 | `health_check.interval` | 10 | 每轮间隔（秒） |
 | `health_check.fall` / `rise` | 3 / 2 | 连续失败多少次摘除 / 连续成功多少次加回 |
-| `health_check.global_freeze_ratio` | 0.5 | 同一轮超过该比例的在线节点失败时冻结，不摘除任何节点 |
+| `health_check.global_freeze_ratio` | 0.5 | 同一轮超过该比例的在线节点失败时冻结，不摘除任何节点。只有 1 台在线节点时不判断 |
 | `health_check.pool_failover_after` | 180 | 仅 Route 53：整池故障持续多久后撤下该区域，流量转到其他区域。Cloudflare 下整池故障时直接撤下，由其他池承接 |
 | `warmup.timeout` | 900 | 从建机到上线的最长时间 |
 | `drain.min` / `drain.max` | 300 / 1800 | 排空时间，从确认节点已不在 DNS 中时算起：配置了 `drain.idle` 时，过了 min 且流量低于阈值即可删除；否则等满 max |
 | `autoheal.unhealthy_for` | 300 | 在线节点持续不健康多久后替换 |
-| `autoheal.max_unhealthy_ratio` | 0.5 | 所有在线节点中不健康比例超过此值视为系统性故障，只告警不替换 |
+| `autoheal.max_unhealthy_ratio` | 0.5 | 所有在线节点中不健康比例超过此值视为系统性故障，只告警不替换。只有 1 台在线节点时不判断 |
 | `autoheal.max_replacements_per_hour` | 5 | 每小时自动替换上限 |
 | `autoheal.max_warmup_failures` / `pause_for` | 3 / 3600 | 连续多少台新节点未能上线就暂停该池建机，以及暂停多久 |
 | `scaling.step` | 1 | 每次扩 / 缩台数 |
 | `scaling.sustain` | 300 | 指标持续超过阈值多久才动作 |
 | `scaling.cooldown_out` / `cooldown_in` | 600 / 900 | 扩容冷却 / 缩容冷却（距上次任何扩缩容） |
 | `scaling.min_coverage` | 0.5 | 有指标数据的在线节点比例低于此值时不做决策 |
-| `notify.throttle` | 3600 | 同一告警最小发送间隔 |
+| `notify.throttle` | 3600 | 同一告警最小发送间隔。恢复通知不受限制：已发出的告警恢复时一定会收到恢复通知，之后再次故障立即告警 |
 
 池可以用 `pools.<池>.scaling` 覆盖全局 `scaling` 的任意项；把某个指标设为 `null` 可在该池禁用它。
 
@@ -313,10 +314,12 @@ if ($preview->orphans !== [] && $this->confirm('确认删除这些实例？')) {
 
 - **DNS 负载均衡生效慢**：新节点只能接到新解析的流量，已缓存 IP 的客户端在 TTL 内（部分运营商 DNS 更久）仍访问旧节点。扩容要留出冷却时间，缩容依靠排空期覆盖缓存。
 - **单探测点**：健康检查只从控制器一个位置发起。金丝雀地址检测探测机自身网络，全局冻结防止探测机线路问题导致大面积误摘；代价是同一轮超过半数节点真实故障时，故障节点会留在 DNS 中，需要人工介入（见下方「后续迭代」）。
+- **单节点服务**：整个服务只有 1 台在线节点时，比例保护没有意义（任何故障都是 100%），因此不冻结、也不判定为系统性故障。节点故障时记录保留（没有其他节点可切），持续 `autoheal.unhealthy_for` 后建替补，替补上线后再排空旧节点。探测机到节点的线路故障也会触发替换：替补通常同样通不过检查，旧节点保留在 DNS 中；连续 `max_warmup_failures` 台失败后该池暂停建机并告警。2 台及以上时照常保护（两台同时故障仍会冻结）。
 - **IMDSv2**：EC2 实例强制使用 IMDSv2，cloud-init 脚本读取实例元数据时需要先申请令牌。
 - **按指标不会缩容到 0 台**：缩容前会预测剩余节点的负载，剩 0 台时预测不成立。
+- **容量到顶**：已达到 max 而指标仍持续超过扩容阈值时，发出 `scale_at_max` 告警（每个池每小时最多一次），需要人来决定调大 max 还是换用更大的机型。
 - **节点上报指标**必须带 `node_id` 标签。查询返回同一节点多条序列，或序列缺少 `node_id` 标签时，该指标视为不可用，不做决策。
-- **改名或替换全部池**：建议先加新池，新节点上线后再删旧池。一次换掉全部池也不会断解析：没有可以发布的节点时，对外名称保留现有记录（发出 `dns_empty_held` 告警），旧节点继续服务到新节点上线后再切换。反过来，删掉全部池并不会让域名下线，记录和旧机器会一直保留，下线整个服务需要手动删除记录。
+- **改名或替换全部池**：建议先加新池，新节点上线后再删旧池。一次换掉全部池也不会断解析：没有可以发布的节点时，对外名称保留现有记录（发出 `dns_empty_held` 告警），旧节点继续服务到新节点上线后再切换。反过来，删掉全部池并不会让域名下线，记录和旧机器会一直保留，下线整个服务需要手动删除记录（删除后收到 `dns_empty_released`，排空开始计时，之后删除机器）。
 
 使用 Cloudflare 时：
 

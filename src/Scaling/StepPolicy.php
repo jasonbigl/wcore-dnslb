@@ -55,7 +55,7 @@ final class StepPolicy implements ScalingPolicyInterface
                 return new Decision(0, "{$reason}, waiting for {$s->pending} starting node(s)", $since);
             }
             if ($active >= $max) {
-                return new Decision(0, "{$reason}, already at max ({$max})", $since);
+                return new Decision(0, "{$reason}, already at max ({$max})", $since, null, true);
             }
             // 动作后重新计算持续时间
             return new Decision(min($scaling->step, $max - $active), $reason);

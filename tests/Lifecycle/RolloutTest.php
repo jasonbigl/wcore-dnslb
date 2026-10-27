@@ -73,7 +73,11 @@ final class RolloutTest extends TestCase
         self::assertSame(Node::DRAINING, $this->t->node('web-tokyo-b')->state);
         self::assertNull($this->tokyoStatus()['rollout']);
         self::assertNull($this->t->app->pools()->get('tokyo')->rolloutStartedAt);
-        self::assertContains('rollout_completed', $this->t->eventTypes());
+        $completed = array_values(array_filter($this->t->app->events()->recent(100), static function ($event): bool {
+            return $event->type === 'rollout_completed';
+        }));
+        self::assertCount(1, $completed);
+        self::assertSame('发布完成：2 台旧节点已全部下线，用时 5 分钟', $completed[0]->message);
         self::assertFalse($this->t->node('web-tokyo-a')->outdated, 'flags are cleared');
         self::assertCount(2, $this->aws->callsMatching('create'));
         self::assertCount(2, $this->t->records('tokyo.pool.app.example.com'));

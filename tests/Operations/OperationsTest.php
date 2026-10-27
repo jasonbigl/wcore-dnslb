@@ -298,8 +298,13 @@ final class OperationsTest extends TestCase
         self::assertTrue($a->v4->healthy);
         self::assertSame(1600000000, $a->createdAt);
         self::assertSame(Node::DRAINING, $this->t->node('web-tokyo-c')->state, 'not in DNS: drained');
+        $event = $this->t->app->events()->recent(1)[0];
+        self::assertSame('state_rebuilt', $event->type);
+        self::assertSame('重建状态库：补充 3 个节点（2 个在线，1 个按排空处理），1 条需要确认', $event->message);
+        self::assertSame(['web-tokyo-a', 'web-tokyo-b', 'web-tokyo-c'], $event->context['nodes']);
 
         self::assertSame([], $this->lb->rebuildState()->restored);
+        self::assertSame('重建状态库：补充 0 个节点（0 个在线，0 个按排空处理），1 条需要确认', $this->t->app->events()->recent(1)[0]->message, 'every run is audited');
         self::assertFalse($this->t->app->dnsSync()->sync()->hasChanges(), 'restored state matches DNS');
     }
 

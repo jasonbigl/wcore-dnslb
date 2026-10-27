@@ -3,6 +3,7 @@
 namespace Wcore\Dnslb\Health;
 
 use Wcore\Dnslb\Config\Config;
+use Wcore\Dnslb\Dns\NodeSelector;
 use Wcore\Dnslb\Notify\EventRecorder;
 use Wcore\Dnslb\State\Meta;
 use Wcore\Dnslb\State\Node;
@@ -18,6 +19,9 @@ use Wcore\Dnslb\Support\Logger;
  * - 金丝雀地址全部不可达：探测机自身网络有问题；
  * - 在线节点失败比例超过 global_freeze_ratio：很可能是探测机到节点的线路问题，或所有节点同时故障，
  *   此时不摘除任何节点（全局冻结），只告警。
+ *
+ * 节点摘除 / 恢复、整池故障事件按 NodeSelector 实际选出的发布结果描述：没有其他健康节点可以承接时，
+ * 不健康的节点会保留在 DNS 中（不会让域名没有记录）。
  */
 final class HealthChecker
 {
@@ -25,11 +29,14 @@ final class HealthChecker
     private const PROBED_STATES = [Node::WARMING, Node::IN_SERVICE, Node::REPLACING];
     /** 在 DNS 中提供服务的状态 */
     private const SERVING_STATES = [Node::IN_SERVICE, Node::REPLACING];
+    private const BECAME_UNHEALTHY = 'unhealthy';
+    private const BECAME_HEALTHY = 'healthy';
 
     private Config $config;
     private Prober $prober;
     private NodeRepository $nodes;
     private PoolRepository $pools;
+    private NodeSelector $selector;
     private Meta $meta;
     private EventRecorder $events;
     private Clock $clock;
@@ -40,6 +47,7 @@ final class HealthChecker
         Prober $prober,
         NodeRepository $nodes,
         PoolRepository $pools,
+        NodeSelector $selector,
         Meta $meta,
         EventRecorder $events,
         Clock $clock,
@@ -49,6 +57,7 @@ final class HealthChecker
         $this->prober = $prober;
         $this->nodes = $nodes;
         $this->pools = $pools;
+        $this->selector = $selector;
         $this->meta = $meta;
         $this->events = $events;
         $this->clock = $clock;
@@ -74,6 +83,8 @@ final class HealthChecker
         }
 
         $summary = new RoundSummary(count($targets));
+        /** @var array<array{0: Node, 1: string, 2: string}> 在线节点的健康变化：节点、协议族、变化 */
+        $changes = [];
         $round = $this->prober->run($targets, array_keys($probedFamilies));
         $nodesById = [];
         foreach ($nodes as $node) {
@@ -99,7 +110,11 @@ final class HealthChecker
                 continue;
             }
             foreach ($familyTargets as $target) {
-                $this->apply($nodesById[$target->nodeId], $family, $round->results[$target->key()], $now, $summary);
+                $node = $nodesById[$target->nodeId];
+                $change = $this->apply($node, $family, $round->results[$target->key()], $now, $summary);
+                if ($change !== null) {
+                    $changes[] = [$node, $family, $change];
+                }
             }
         }
 
@@ -109,9 +124,14 @@ final class HealthChecker
             }
         }
 
+        // NodeSelector 读状态库：保存之前选出的是上一轮的发布结果，保存之后是本轮的
+        $before = $changes === [] ? [] : $this->selected($now);
         foreach ($nodes as $node) {
             $node->probedAt = $now;
             $this->nodes->saveHealth($node);
+        }
+        if ($changes !== []) {
+            $this->recordChanges($changes, $before, $this->selected($now));
         }
         $this->trackPools($nodes, $families, $now);
 
@@ -173,7 +193,9 @@ final class HealthChecker
         }
         $ratio = $serving === 0 ? 0.0 : $failing / $serving;
         $threshold = $this->config->healthCheck->globalFreezeRatio;
-        $frozen = $serving > 0 && $ratio > $threshold;
+        // 只有 1 台在线节点时比例没有意义（任何故障都是 100%），按正常流程处理：
+        // 它不会被摘掉（NodeSelector 在所有节点都不健康时全部恢复发布），自动修复可以替换它
+        $frozen = $serving > 1 && $ratio > $threshold;
 
         $key = "frozen_{$family}";
         $frozenSince = $this->meta->get($key);
@@ -219,12 +241,14 @@ final class HealthChecker
         }
     }
 
-    private function apply(Node $node, string $family, ProbeResult $result, int $now, RoundSummary $summary): void
+    /**
+     * @return string|null 在线节点变为不健康 / 恢复健康时返回 BECAME_UNHEALTHY / BECAME_HEALTHY
+     */
+    private function apply(Node $node, string $family, ProbeResult $result, int $now, RoundSummary $summary): ?string
     {
         $health = $node->health($family);
         $check = $this->config->healthCheck;
         $serving = in_array($node->state, self::SERVING_STATES, true);
-        $label = self::familyLabel($family);
 
         if ($health->since === null) {
             $health->since = $now;
@@ -237,11 +261,9 @@ final class HealthChecker
                 $health->healthy = true;
                 $health->since = $now;
                 $summary->becameHealthy++;
-                if ($serving) {
-                    $this->events->info('node_recovered', "节点 {$label} 健康检查恢复，重新加入 DNS", $node->pool, $node->nodeId);
-                }
+                return $serving ? self::BECAME_HEALTHY : null;
             }
-            return;
+            return null;
         }
 
         $health->fails++;
@@ -251,16 +273,75 @@ final class HealthChecker
             $health->healthy = false;
             $health->since = $now;
             $summary->becameUnhealthy++;
-            if ($serving) {
-                $this->events->warning(
-                    'node_unhealthy',
-                    "节点 {$label} 连续 {$health->fails} 次健康检查失败，从 DNS 摘除：{$result->error}",
-                    $node->pool,
-                    $node->nodeId,
-                    ['ip' => $node->ip($family)]
-                );
+            return $serving ? self::BECAME_UNHEALTHY : null;
+        }
+        return null;
+    }
+
+    /**
+     * 记录节点摘除 / 恢复事件，按发布结果描述是否真的从 DNS 摘除。
+     *
+     * @param array<array{0: Node, 1: string, 2: string}> $changes
+     * @param array<string,array<string,Node>> $before 本轮之前选出发布的节点：协议族 => 节点 ID => 节点
+     * @param array<string,array<string,Node>> $after  本轮之后选出发布的节点
+     */
+    private function recordChanges(array $changes, array $before, array $after): void
+    {
+        foreach ($changes as [$node, $family, $change]) {
+            $label = self::familyLabel($family);
+            $health = $node->health($family);
+            if ($change === self::BECAME_HEALTHY) {
+                $message = isset($before[$family][$node->nodeId])
+                    ? "节点 {$label} 健康检查恢复（故障期间一直保留在 DNS 中）"
+                    : "节点 {$label} 健康检查恢复，重新加入 DNS";
+                $this->events->info('node_recovered', $message, $node->pool, $node->nodeId);
+                continue;
+            }
+            if (!isset($after[$family][$node->nodeId])) {
+                $what = '从 DNS 摘除';
+            } elseif (self::anyHealthy($after[$family], $family)) {
+                // Route 53：整池故障在 pool_failover_after 内保留最后一批节点
+                $what = '整池故障宽限期内暂时保留在 DNS 中';
+            } else {
+                $what = '但没有健康的节点可以承接，暂时保留在 DNS 中';
+            }
+            $this->events->warning(
+                'node_unhealthy',
+                "节点 {$label} 连续 {$health->fails} 次健康检查失败，{$what}：{$health->error}",
+                $node->pool,
+                $node->nodeId,
+                ['ip' => $node->ip($family)]
+            );
+        }
+    }
+
+    /**
+     * @return array<string,array<string,Node>> 当前选出发布的节点：协议族 => 节点 ID => 节点
+     */
+    private function selected(int $now): array
+    {
+        $result = [];
+        foreach ($this->selector->select($now) as $family => $pools) {
+            foreach ($pools as $nodes) {
+                foreach ($nodes as $node) {
+                    $result[$family][$node->nodeId] = $node;
+                }
             }
         }
+        return $result;
+    }
+
+    /**
+     * @param Node[] $nodes
+     */
+    private static function anyHealthy(array $nodes, string $family): bool
+    {
+        foreach ($nodes as $node) {
+            if ($node->health($family)->healthy) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -290,11 +371,7 @@ final class HealthChecker
                 if ($down && $state->downSince($family) === null) {
                     $state->setDownSince($family, $now);
                     $changed = true;
-                    $this->events->critical(
-                        'pool_down',
-                        "池内全部 {$candidates} 个在线节点 {$label} 均不健康，若 {$this->config->healthCheck->poolFailoverAfter} 秒内未恢复，将把该区域从 DNS 撤下，流量转到其他区域",
-                        $name
-                    );
+                    $this->events->critical('pool_down', $this->poolDownMessage($name, $family, $candidates, $nodes), $name);
                 } elseif (!$down && $state->downSince($family) !== null) {
                     $downFor = $now - (int) $state->downSince($family);
                     $state->setDownSince($family, null);
@@ -306,6 +383,30 @@ final class HealthChecker
                 $this->pools->saveHealth($state);
             }
         }
+    }
+
+    /**
+     * 整池故障时 DNS 会怎样：其他池有健康节点时撤下该池（Route 53 等 pool_failover_after，Cloudflare 立即）；
+     * 没有时全部保留（NodeSelector 不会让域名没有记录）。
+     *
+     * @param Node[] $nodes 本轮探测的节点
+     */
+    private function poolDownMessage(string $pool, string $family, int $candidates, array $nodes): string
+    {
+        $message = "池内全部 {$candidates} 个在线节点 " . self::familyLabel($family) . ' 均不健康，';
+        foreach ($nodes as $node) {
+            if ($node->pool !== $pool
+                && isset($this->config->pools[$node->pool])
+                && in_array($node->state, self::SERVING_STATES, true)
+                && $node->ip($family) !== null
+                && $node->health($family)->healthy
+            ) {
+                return $message . ($this->config->dns->isCloudflare()
+                    ? '已从 DNS 撤下，由其他池的节点承接'
+                    : "若 {$this->config->healthCheck->poolFailoverAfter} 秒内未恢复，将把该区域从 DNS 撤下，流量转到其他区域");
+            }
+        }
+        return $message . '没有其他池可以承接，暂时保留在 DNS 中';
     }
 
     private static function familyLabel(string $family): string

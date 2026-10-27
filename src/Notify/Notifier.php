@@ -14,17 +14,21 @@ use Wcore\Dnslb\Support\Logger;
  * 把待通知的事件合并成一封邮件发送（每个 tick 最多一封）。
  *
  * - 发送 warning / critical 事件，以及已告警问题的恢复通知；
- * - 同一告警（类型 + 池 + 节点）在 notify.throttle 秒内只发一次；发出恢复通知后，同一对象再次故障立即告警；
+ * - 同一告警（类型 + 池 + 节点）在 notify.throttle 秒内只发一次；
+ * - 恢复通知与告警配对：对应告警发出过且还没有发过恢复时一定发送，不受限频影响；对应告警没有发出过时不发送。
+ *   发出恢复通知后，同一对象再次故障立即告警；
  * - 发送失败时事件保持待发送，下个 tick 重试；超过一天仍未发出的不再发送。
  */
 final class Notifier
 {
     /** 恢复通知 => 对应的故障告警 */
     private const RECOVERY_TYPES = [
+        'node_recovered' => 'node_unhealthy',
         'pool_recovered' => 'pool_down',
         'global_freeze_lifted' => 'global_freeze',
         'canary_recovered' => 'canary_down',
         'dns_empty_released' => 'dns_empty_held',
+        'dns_foreign_records_removed' => 'dns_foreign_records',
     ];
     private const MAX_PENDING_AGE = 86400;
     private const LEVEL_LABELS = [Event::CRITICAL => 'CRITICAL', Event::WARNING => 'WARNING', Event::INFO => 'RECOVERY'];
@@ -56,13 +60,26 @@ final class Notifier
         $now = $this->clock->now();
 
         $toSend = [];
+        // 本封邮件中不受限频的告警键：已在本封中发出，或刚发出恢复通知
         $keys = [];
+        // 告警键 => 是否有已发出、尚未恢复的告警（本封邮件带来的变化；不在其中的以 alerts_sent 为准）
+        $open = [];
         $handled = [];
         $suppressed = 0;
         foreach ($pending as $event) {
             $handled[] = (int) $event->id;
-            $important = $event->level !== Event::INFO || isset(self::RECOVERY_TYPES[$event->type]);
-            if ($notify === null || !$important || $now - $event->at > self::MAX_PENDING_AGE) {
+            $recoveryOf = self::RECOVERY_TYPES[$event->type] ?? null;
+            if ($notify === null || ($event->level === Event::INFO && $recoveryOf === null) || $now - $event->at > self::MAX_PENDING_AGE) {
+                continue;
+            }
+            if ($recoveryOf !== null) {
+                $key = self::alertKey($recoveryOf, $event);
+                if (!($open[$key] ?? $this->alerts->lastSentAt($key) !== null)) {
+                    continue;
+                }
+                $open[$key] = false;
+                $keys[$key] = true;
+                $toSend[] = $event;
                 continue;
             }
             $key = self::alertKey($event->type, $event);
@@ -71,6 +88,7 @@ final class Notifier
                 continue;
             }
             $keys[$key] = true;
+            $open[$key] = true;
             $toSend[] = $event;
         }
 
@@ -86,11 +104,12 @@ final class Notifier
                 $this->events->markNotified(array_values(array_diff($handled, $sendingIds)));
                 return;
             }
-            // 按事件顺序记录：最后发出的是恢复通知时，同一对象下次故障不受限频影响
-            foreach ($toSend as $event) {
-                $this->alerts->markSent(self::alertKey($event->type, $event), $now);
-                if (isset(self::RECOVERY_TYPES[$event->type])) {
-                    $this->alerts->clear(self::alertKey(self::RECOVERY_TYPES[$event->type], $event));
+            // 最后发出的是恢复通知时清除告警记录：同一对象下次故障不受限频影响，之前的恢复也不会再发
+            foreach ($open as $key => $isOpen) {
+                if ($isOpen) {
+                    $this->alerts->markSent($key, $now);
+                } else {
+                    $this->alerts->clear($key);
                 }
             }
             $this->logger->info('Notification email sent', ['events' => count($toSend), 'suppressed' => $suppressed]);

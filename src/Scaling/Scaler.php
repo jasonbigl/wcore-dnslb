@@ -10,6 +10,7 @@ use Wcore\Dnslb\Lifecycle\Reconciler;
 use Wcore\Dnslb\Metrics\MetricException;
 use Wcore\Dnslb\Metrics\MetricRegistry;
 use Wcore\Dnslb\Notify\EventRecorder;
+use Wcore\Dnslb\State\Meta;
 use Wcore\Dnslb\State\Node;
 use Wcore\Dnslb\State\NodeRepository;
 use Wcore\Dnslb\State\PoolRepository;
@@ -24,6 +25,8 @@ final class Scaler
 {
     private const PENDING_STATES = [Node::PROVISIONING, Node::BOOTING, Node::WARMING];
     private const SERVING_STATES = [Node::IN_SERVICE, Node::REPLACING];
+    /** 已达到 max 仍需扩容时，每个池最多每隔这么久记录一次告警 */
+    private const AT_MAX_NOTICE_INTERVAL = 3600;
 
     private Config $config;
     private MetricRegistry $metrics;
@@ -32,6 +35,7 @@ final class Scaler
     private Provisioner $provisioner;
     private Reconciler $reconciler;
     private EventRecorder $events;
+    private Meta $meta;
     private Clock $clock;
     private Logger $logger;
 
@@ -43,6 +47,7 @@ final class Scaler
         Provisioner $provisioner,
         Reconciler $reconciler,
         EventRecorder $events,
+        Meta $meta,
         Clock $clock,
         Logger $logger
     ) {
@@ -53,6 +58,7 @@ final class Scaler
         $this->provisioner = $provisioner;
         $this->reconciler = $reconciler;
         $this->events = $events;
+        $this->meta = $meta;
         $this->clock = $clock;
         $this->logger = $logger;
     }
@@ -104,6 +110,9 @@ final class Scaler
         $state->outBreachSince = $decision->outBreachSince;
         $state->inBreachSince = $decision->inBreachSince;
         $this->logger->debug("Pool {$pool->name}: {$decision->reason}", ['delta' => $decision->delta]);
+        if ($decision->atMax) {
+            $this->noticeAtMax($pool, $decision, $values);
+        }
 
         if ($decision->delta > 0) {
             if ($state->isPaused($now)) {
@@ -170,6 +179,30 @@ final class Scaler
             return null;
         }
         return $rule->aggregate === MetricRule::AGGREGATE_MAX ? max($values) : array_sum($values) / count($values);
+    }
+
+    /**
+     * 已达到 max 但负载仍持续超过扩容阈值：需要人来决定调大 max 还是换机型。每个池每小时最多记录一次告警。
+     *
+     * @param array<string,float|null> $values
+     */
+    private function noticeAtMax(PoolConfig $pool, Decision $decision, array $values): void
+    {
+        $now = $this->clock->now();
+        $key = "notice_scale_at_max_{$pool->name}";
+        $last = $this->meta->get($key);
+        if ($last !== null && $now - (int) $last < self::AT_MAX_NOTICE_INTERVAL) {
+            $this->logger->warning("Pool {$pool->name} cannot scale out: {$decision->reason}");
+            return;
+        }
+        $this->meta->set($key, (string) $now);
+        $this->events->warning(
+            'scale_at_max',
+            "已达到 max，无法继续扩容：{$decision->reason}。负载持续偏高时调大 max 或换用更大的机型",
+            $pool->name,
+            null,
+            ['metrics' => $values]
+        );
     }
 
     private function policy(PoolConfig $pool): ScalingPolicyInterface

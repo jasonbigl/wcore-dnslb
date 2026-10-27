@@ -73,6 +73,43 @@ final class CloudflareEndToEndTest extends TestCase
         self::assertContains('terminate ' . $this->aws->instanceOf($drained->nodeId)->id, $this->aws->calls);
     }
 
+    public function testSingleNodeServiceIsReplacedWithoutEverLosingItsRecord(): void
+    {
+        $this->t = new TestApp(['dns' => ['ipv6' => false], 'pools' => ['tokyo' => ['min' => 1], 'frankfurt' => ['min' => 0]]], true);
+        $this->lb = $this->t->lb(['aws' => $this->aws]);
+        $this->lb->tick();
+        $old = $this->t->app->nodes()->live()[0]->nodeId;
+        $this->aws->boot($old, '10.0.0.1');
+        $this->tick();
+        $this->health(2);
+        $this->tick();
+        self::assertSame(['A 10.0.0.1'], $this->contents());
+
+        // 应用故障：唯一的节点不健康，记录保留（没有其他节点可切），不冻结
+        $this->t->network->status['10.0.0.1'] = 503;
+        $this->health(3);
+        self::assertFalse($this->t->node($old)->v4->healthy);
+        self::assertNull($this->t->app->meta()->get('frozen_v4'));
+        self::assertSame(['A 10.0.0.1'], $this->contents());
+
+        // 持续 unhealthy_for 后建替补，替补上线后切换并排空旧节点
+        $this->t->clock->advance(300);
+        $this->tick();
+        $replacement = (string) $this->t->node($old)->replacedBy;
+        self::assertNotSame('', $replacement);
+        $this->aws->boot($replacement, '10.0.0.2');
+        $this->tick();
+        $this->health(2);
+        $this->tick();
+
+        self::assertSame(Node::IN_SERVICE, $this->t->node($replacement)->state);
+        self::assertSame(Node::DRAINING, $this->t->node($old)->state);
+        self::assertSame(['A 10.0.0.2'], $this->contents());
+        self::assertContains('autoheal_replace', $this->t->eventTypes());
+        self::assertNotContains('global_freeze', $this->t->eventTypes());
+        self::assertNotContains('autoheal_systemic', $this->t->eventTypes());
+    }
+
     public function testTakeoverAndCheckWithoutAws(): void
     {
         $this->t->network->cloudflare->add(new DnsRecord('A', self::NAME, '203.0.113.9', true));
@@ -92,6 +129,37 @@ final class CloudflareEndToEndTest extends TestCase
         self::assertContains('Cloudflare 现有记录', $names);
         self::assertNotContains('Route 53 托管区域', $names);
         self::assertSame(['provider' => 'cloudflare', 'name' => self::NAME, 'routing' => 'proxied', 'ipv6' => false], $this->lb->status()['dns']);
+    }
+
+    public function testNodesComingUpBeforeTakeoverAreReportedAsNotServing(): void
+    {
+        $this->t->network->cloudflare->add(new DnsRecord('A', self::NAME, '203.0.113.9', true));
+        $this->lb->tick();
+        foreach ($this->t->app->nodes()->live() as $i => $node) {
+            $this->aws->boot($node->nodeId, "10.0.0.{$i}");
+        }
+        $this->tick();
+        $this->health(2);
+        $this->tick();
+
+        self::assertSame(['A 203.0.113.9'], $this->contents());
+        $messages = $this->messages('node_in_service');
+        self::assertCount(3, $messages);
+        self::assertMatchesRegularExpression(
+            '/^节点通过健康检查（从创建到上线 \d+ 秒）。app\.example\.com 上还有不由 dnslb 管理的记录，调用 Dnslb::takeover\(\) 接管之前不会接到流量$/u',
+            $messages[0]
+        );
+
+        $this->lb->takeover();
+        self::assertFalse($this->t->app->foreignRecords()->takeoverPending(), 'cleared by the takeover itself, before the next sync');
+
+        $created = $this->lb->scale('tokyo', 1)->created[0];
+        $this->aws->boot($created->nodeId, '10.0.0.9');
+        $this->tick();
+        $this->health(2);
+        $this->tick();
+        self::assertMatchesRegularExpression('/^节点通过健康检查，加入 DNS（从创建到上线 \d+ 秒）$/u', $this->messages('node_in_service')[3]);
+        self::assertContains('A 10.0.0.9', $this->contents());
     }
 
     public function testRebuildStateUsesCloudflareRecords(): void
@@ -128,6 +196,19 @@ final class CloudflareEndToEndTest extends TestCase
         }, $this->t->network->cloudflare->recordsNamed(self::NAME));
         sort($result);
         return $result;
+    }
+
+    /**
+     * @return string[] 指定类型事件的内容，按时间顺序
+     */
+    private function messages(string $type): array
+    {
+        $events = array_filter($this->t->app->events()->recent(1000), static function ($event) use ($type): bool {
+            return $event->type === $type;
+        });
+        return array_reverse(array_values(array_map(static function ($event): string {
+            return $event->message;
+        }, $events)));
     }
 
     private function health(int $rounds): void
