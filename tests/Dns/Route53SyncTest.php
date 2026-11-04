@@ -48,6 +48,7 @@ final class Route53SyncTest extends TestCase
         $t->app->nodes()->saveHealth($a);
         $result = $t->app->dnsSync()->sync();
         self::assertSame(['DELETE A tokyo.pool.app.example.com [web-tokyo-a] 10.0.0.1'], self::describe($result->changes));
+        self::assertNotContains('pool_withdrawn', $t->eventTypes());
 
         // 整池故障超过宽限期：latency 记录必须先于池记录删除
         $b->v4->healthy = false;
@@ -65,6 +66,15 @@ final class Route53SyncTest extends TestCase
         ], self::describe($result->changes));
         self::assertSame([], $t->records(self::POOL));
         self::assertSame(['A dnslb-frankfurt -> frankfurt.pool.app.example.com'], $t->records('app.example.com'));
+        $events = $t->app->events()->recent(10);
+        self::assertSame('pool_withdrawn', $events[0]->type);
+        self::assertSame('tokyo', $events[0]->pool);
+        self::assertSame('池 IPv4 整池故障 181 秒，已把该区域（ap-northeast-1）从 DNS 撤下，流量转到其他区域；恢复后自动重新发布', $events[0]->message);
+
+        // 撤下只记录一次
+        $t->clock->advance(60);
+        self::assertFalse($t->app->dnsSync()->sync()->hasChanges());
+        self::assertCount(1, array_keys($t->eventTypes(), 'pool_withdrawn', true));
     }
 
     public function testSwitchingRoutingPolicyDetachesLatencyRecordFirst(): void
@@ -78,6 +88,10 @@ final class Route53SyncTest extends TestCase
         $weighted->network->route53->records = $t->network->route53->records;
         $weighted->addNode('web-tokyo-a', 'tokyo', Node::IN_SERVICE, '10.0.0.1');
         $weighted->addNode('web-tokyo-c', 'tokyo', Node::IN_SERVICE, '10.0.0.3');
+        // 池仍标记为整池故障时，同一批次中先删后建的 latency 记录也不算撤下
+        $pool = $weighted->app->pools()->get('tokyo');
+        $pool->setDownSince('v4', $weighted->clock->now());
+        $weighted->app->pools()->saveHealth($pool);
 
         $result = $weighted->app->dnsSync()->sync();
 
@@ -90,6 +104,7 @@ final class Route53SyncTest extends TestCase
             'UPSERT A app.example.com [dnslb-tokyo] region=ap-northeast-1 -> ' . self::POOL,
         ], self::describe($result->changes));
         self::assertSame(['A web-tokyo-a 10.0.0.1', 'A web-tokyo-c 10.0.0.3'], $weighted->records(self::POOL));
+        self::assertNotContains('pool_withdrawn', $weighted->eventTypes());
     }
 
     public function testCleansUpPoolsRemovedFromConfig(): void
@@ -106,6 +121,7 @@ final class Route53SyncTest extends TestCase
 
         self::assertSame(['A dnslb-tokyo -> ' . self::POOL], $t->records('app.example.com'));
         self::assertSame(['A manual-1 10.0.5.9'], $t->records('osaka.pool.app.example.com'));
+        self::assertNotContains('pool_withdrawn', $t->eventTypes(), 'removing a pool from config is not a failure');
     }
 
     public function testForeignRecordsOnPublicNameDeferLatencyLayerUntilTakeover(): void

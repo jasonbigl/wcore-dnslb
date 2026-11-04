@@ -11,6 +11,7 @@ use Wcore\Dnslb\Dns\DnsSync;
 use Wcore\Dnslb\Dns\EmptyPublishGuard;
 use Wcore\Dnslb\Dns\ForeignRecordTracker;
 use Wcore\Dnslb\Dns\NodeSelector;
+use Wcore\Dnslb\Dns\PoolWithdrawalTracker;
 use Wcore\Dnslb\Dns\Route53Planner;
 use Wcore\Dnslb\Dns\Route53Sync;
 use Wcore\Dnslb\Health\HealthChecker;
@@ -190,6 +191,7 @@ final class Application
                     $this->lock('dns'),
                     $guard,
                     $foreign,
+                    new PoolWithdrawalTracker($this->config, $this->pools(), $this->eventRecorder(), $this->clock()),
                     $this->clock(),
                     $this->logger()
                 );

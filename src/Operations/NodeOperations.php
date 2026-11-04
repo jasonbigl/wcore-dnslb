@@ -109,13 +109,41 @@ final class NodeOperations
 
     /**
      * 重新检查孤儿实例，删除已确认的（演练模式下只列出）。
+     *
+     * 状态库丢失或从备份恢复时，正在服务的机器也会被当成孤儿：节点 ID 仍在 DNS 中、而状态库里没有这个在线节点的
+     * 实例一律跳过（删除会让用户访问失败，并释放仍被解析到的 IP）。状态库里有同 ID 的在线节点时，DNS 中的记录属于那台，
+     * 孤儿是换建机方式时多建的一台，照常删除。读不到 DNS 记录时全部跳过。
      */
     public function cleanupOrphans(): OrphanCleanupResult
     {
         $tracker = $this->app->orphanTracker();
         $tracker->track(true);
         $result = new OrphanCleanupResult($this->app->isDryRun());
-        foreach ($tracker->confirmed() as $orphan) {
+        $confirmed = $tracker->confirmed();
+        if ($confirmed === []) {
+            return $result;
+        }
+        $unreadable = null;
+        try {
+            $published = $this->app->dnsSync()->publishedNodeIds();
+        } catch (\Throwable $e) {
+            $published = [];
+            $unreadable = $e->getMessage();
+        }
+        $live = [];
+        foreach ($this->app->nodes()->live() as $node) {
+            $live[$node->nodeId] = true;
+        }
+
+        foreach ($confirmed as $orphan) {
+            if ($unreadable !== null) {
+                $result->skipped[$orphan->instanceId] = "读不到 DNS 记录，无法确认是否仍在服务：{$unreadable}";
+                continue;
+            }
+            if ($orphan->nodeId !== null && isset($published[$orphan->nodeId]) && !isset($live[$orphan->nodeId])) {
+                $result->skipped[$orphan->instanceId] = "节点 {$orphan->nodeId} 仍在 DNS 中，可能正在服务（状态库丢失或从备份恢复？），先运行 rebuildState()";
+                continue;
+            }
             $result->orphans[] = $orphan;
             if ($result->dryRun) {
                 continue;

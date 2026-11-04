@@ -88,8 +88,16 @@ final class LinodeProvider implements ProviderInterface
 
     public function findByNodeId(string $region, string $nodeId): ?Instance
     {
-        $items = $this->client->listAll('/linode/instances', ['label' => $nodeId]);
-        return $items === [] ? null : $this->toInstance($items[0]);
+        // label 只在账号内去重，手工建的机器也可能恰好同名：节点 ID（{服务}-{池}-{6 位}）与实例的服务、池标签对得上才算
+        foreach ($this->client->listAll('/linode/instances', ['label' => $nodeId]) as $item) {
+            $instance = $this->toInstance($item);
+            $service = $instance->tags[ProviderInterface::TAG_SERVICE] ?? null;
+            $pool = $instance->tags[ProviderInterface::TAG_POOL] ?? null;
+            if ($service !== null && $pool !== null && preg_match('/^' . preg_quote("{$service}-{$pool}-", '/') . '[a-z0-9]{6}$/', $nodeId)) {
+                return $instance;
+            }
+        }
+        return null;
     }
 
     public function listManaged(string $service, array $regions): array

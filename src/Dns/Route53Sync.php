@@ -32,6 +32,7 @@ final class Route53Sync implements DnsSync
     private FileLock $lock;
     private EmptyPublishGuard $guard;
     private ForeignRecordTracker $foreign;
+    private PoolWithdrawalTracker $withdrawals;
     private Clock $clock;
     private Logger $logger;
 
@@ -42,6 +43,7 @@ final class Route53Sync implements DnsSync
         FileLock $lock,
         EmptyPublishGuard $guard,
         ForeignRecordTracker $foreign,
+        PoolWithdrawalTracker $withdrawals,
         Clock $clock,
         Logger $logger
     ) {
@@ -51,6 +53,7 @@ final class Route53Sync implements DnsSync
         $this->lock = $lock;
         $this->guard = $guard;
         $this->foreign = $foreign;
+        $this->withdrawals = $withdrawals;
         $this->clock = $clock;
         $this->logger = $logger;
     }
@@ -205,6 +208,7 @@ final class Route53Sync implements DnsSync
             $ids[] = $this->route53->changeRecordSets($this->config->dns->zoneId, $batch, "dnslb {$this->config->service}");
         }
         $this->logger->info('DNS changes submitted', ['changes' => count($changes), 'change_ids' => $ids]);
+        $this->withdrawals->submitted($changes);
         return new SyncResult($changes, $ids, false);
     }
 

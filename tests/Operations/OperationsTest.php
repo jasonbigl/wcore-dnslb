@@ -291,7 +291,10 @@ final class OperationsTest extends TestCase
         self::assertSame(['web-tokyo-a', 'web-tokyo-b', 'web-tokyo-c'], array_map(static function (Node $n) {
             return $n->nodeId;
         }, $result->restored));
-        self::assertCount(1, $result->warnings, 'instance without node id');
+        self::assertCount(2, $result->warnings);
+        $warnings = implode("\n", $result->warnings);
+        self::assertStringContainsString('i-x 没有节点 ID', $warnings);
+        self::assertStringContainsString('web-tokyo-c）不在 app.example.com 的 DNS 记录中，按排空处理（drain.max 后删除）；如果同一云账号里有另一套部署使用了相同的服务名', $warnings);
         $a = $this->t->node('web-tokyo-a');
         self::assertSame(Node::IN_SERVICE, $a->state);
         self::assertSame('i-a', $a->instanceId);
@@ -300,7 +303,7 @@ final class OperationsTest extends TestCase
         self::assertSame(Node::DRAINING, $this->t->node('web-tokyo-c')->state, 'not in DNS: drained');
         $event = $this->t->app->events()->recent(1)[0];
         self::assertSame('state_rebuilt', $event->type);
-        self::assertSame('重建状态库：补充 3 个节点（2 个在线，1 个按排空处理），1 条需要确认', $event->message);
+        self::assertSame('重建状态库：补充 3 个节点（2 个在线，1 个按排空处理），2 条需要确认', $event->message);
         self::assertSame(['web-tokyo-a', 'web-tokyo-b', 'web-tokyo-c'], $event->context['nodes']);
 
         self::assertSame([], $this->lb->rebuildState()->restored);
@@ -328,6 +331,32 @@ final class OperationsTest extends TestCase
         self::assertSame(CheckItem::FAIL, $byName['池 tokyo 建机方式 1（aws/ap-northeast-1）']->status);
         self::assertContains($byName['池 tokyo 建机方式 1（aws/ap-northeast-1）'], $report->failures());
         self::assertFalse($report->passed());
+        self::assertSame(CheckItem::OK, $byName['服务名冲突']->status);
+    }
+
+    public function testCheckWarnsAboutTaggedInstancesThatAreNeitherInStateNorInDns(): void
+    {
+        $tags = ['dnslb:service' => 'web', 'dnslb:pool' => 'tokyo'];
+        // 本服务的节点、仍在 DNS 中的节点（例如状态库丢失）、另一套部署用同一服务名建的机器
+        $known = $this->t->addNode('web-tokyo-aaaaaa', 'tokyo', Node::IN_SERVICE, '10.0.0.1');
+        $known->instanceId = 'i-a';
+        $this->t->app->nodes()->save($known, $this->t->clock->now());
+        $this->aws->instances['i-a'] = new Instance('aws', 'i-a', 'ap-northeast-1', Instance::RUNNING, '10.0.0.1', null, 'web-tokyo-aaaaaa', $tags);
+        $this->t->network->route53->add(RecordSet::multiValue('tokyo.pool.app.example.com', 'A', 'web-tokyo-bbbbbb', 60, ['10.0.0.2']));
+        $this->aws->instances['i-b'] = new Instance('aws', 'i-b', 'ap-northeast-1', Instance::RUNNING, '10.0.0.2', null, 'web-tokyo-bbbbbb', $tags);
+        $this->aws->instances['i-o'] = new Instance('aws', 'i-o', 'ap-northeast-1', Instance::RUNNING, '10.9.0.1', null, 'web-tokyo-cccccc', $tags);
+
+        $item = null;
+        foreach ($this->lb->check()->items as $candidate) {
+            if ($candidate->name === '服务名冲突') {
+                $item = $candidate;
+            }
+        }
+
+        self::assertNotNull($item);
+        self::assertSame(CheckItem::WARN, $item->status);
+        self::assertStringStartsWith('1 台带 dnslb:service=web 标签的实例既不在状态库、也不在 app.example.com 的 DNS 记录中：aws/ap-northeast-1 i-o（web-tokyo-cccccc）', $item->message);
+        self::assertStringContainsString('请给本服务换一个名字', $item->message);
     }
 
     private function useApp(TestApp $t): void

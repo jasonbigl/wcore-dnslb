@@ -349,11 +349,11 @@ final class Reconciler
             return;
         }
         if ($instance === null || $instance->status === Instance::GONE) {
-            $this->lost($node, '实例已不存在（被删除或宿主机故障）');
+            $this->lost($node, '实例已不存在（被删除或宿主机故障）', false);
             return;
         }
         if ($instance->status === Instance::STOPPED) {
-            $this->lost($node, '实例已停止');
+            $this->lost($node, '实例已停止', true);
             return;
         }
         if (self::updateAddresses($node, $instance)) {
@@ -391,7 +391,11 @@ final class Reconciler
             $node->dnsRemovedAt = $now;
             $this->nodes->save($node, $now);
         }
-        if (!$this->drainComplete($node, $now)) {
+        // 已停止的实例收不到流量，空闲指标不能说明缓存已过期，等满 drain.max（与正常排空覆盖同样的 DNS 缓存）
+        $complete = $instance !== null && $instance->status === Instance::STOPPED
+            ? $now - (int) $node->dnsRemovedAt >= $this->config->drain->max
+            : $this->drainComplete($node, $now);
+        if (!$complete) {
             return;
         }
         $this->terminate($node);
@@ -576,14 +580,31 @@ final class Reconciler
     }
 
     /**
-     * 在线节点的实例丢失或停止：立即撤下并删除（替补由 min 保障或自动修复补上）。
+     * 在线节点的实例丢失或停止：立即撤下（替补由 min 保障或自动修复补上）。
+     *
+     * 实例已不存在时直接结束。实例只是停止时先保留，确认已从 DNS 摘除后等满 drain.max 才删除：
+     * 删除会释放公网 IP，云厂商很快会把它分配给别人（Linode 实测十几分钟），缓存了旧记录的用户会访问到别人的机器。
      */
-    private function lost(Node $node, string $reason): void
+    private function lost(Node $node, string $reason, bool $stopped): void
     {
-        $this->events->warning('node_lost', $reason . '，撤下节点', $node->pool, $node->nodeId);
         $node->lastError = $reason;
         $this->lost[] = $node;
-        $this->terminate($node);
+        if (!$stopped) {
+            $this->events->warning('node_lost', $reason . '，撤下节点', $node->pool, $node->nodeId);
+            $this->terminate($node);
+            return;
+        }
+
+        $now = $this->clock->now();
+        $node->transition(Node::DRAINING, $now);
+        $node->dnsRemovedAt = null;
+        $this->nodes->save($node, $now);
+        $wait = $this->config->drain->max;
+        $message = $this->hasPublishableNodes()
+            ? "{$reason}，从 DNS 摘除；确认摘除后保留实例 {$wait} 秒（等 DNS 缓存过期，避免 IP 被他人复用）再删除"
+            // EmptyPublishGuard 不会把对外名称同步成没有记录
+            : "{$reason}。没有其他可以发布的节点，DNS 记录暂时保留（见 dns_empty_held），摘除后保留实例 {$wait} 秒再删除";
+        $this->events->warning('node_lost', $message, $node->pool, $node->nodeId);
     }
 
     private function fail(Node $node, string $type, string $message, string $level = 'warning'): void

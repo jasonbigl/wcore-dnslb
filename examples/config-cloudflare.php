@@ -8,6 +8,7 @@
  */
 
 return [
+    // 同一个云账号内必须唯一（见 config.php）
     'service' => 'api',
     'state' => '/var/lib/dnslb/api.sqlite',
 

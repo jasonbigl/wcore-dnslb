@@ -3,6 +3,7 @@
 namespace Wcore\Dnslb\Tests\Lifecycle;
 
 use PHPUnit\Framework\TestCase;
+use Wcore\Dnslb\Aws\Route53\RecordSet;
 use Wcore\Dnslb\Provider\Instance;
 use Wcore\Dnslb\State\Node;
 use Wcore\Dnslb\State\OrphanInstance;
@@ -118,6 +119,46 @@ final class OrphanTrackerTest extends TestCase
         self::assertSame([], $lb->status()['orphans']);
         self::assertSame(Instance::RUNNING, $this->aws->instances['i-a']->status, 'referenced instances are never touched');
         self::assertSame(Instance::RUNNING, $this->aws->instances['i-p']->status);
+        $this->t->app->lock('tick')->release();
+    }
+
+    public function testCleanupSkipsInstancesWhoseNodeIsStillInDns(): void
+    {
+        // 状态库里没有的节点仍在 DNS 中（例如状态库从备份恢复）；状态库里有的 web-tokyo-a 也在 DNS 中
+        $route53 = $this->t->network->route53;
+        $route53->add(RecordSet::multiValue('tokyo.pool.app.example.com', 'A', 'web-tokyo-lost', 60, ['10.0.0.9']));
+        $route53->add(RecordSet::multiValue('tokyo.pool.app.example.com', 'A', 'web-tokyo-a', 60, ['10.0.0.1']));
+        $this->t->app->orphanTracker()->track(true);
+        $this->t->clock->advance(900);
+        $lb = $this->t->lb(['aws' => $this->aws]);
+
+        $preview = $lb->cleanupOrphans();
+        self::assertSame(['i-dup'], self::ids($preview->orphans), 'the record belongs to the known node, not to its duplicate');
+        self::assertSame(['i-lost'], array_keys($preview->skipped));
+        self::assertStringContainsString('仍在 DNS 中', $preview->skipped['i-lost']);
+        self::assertStringContainsString('rebuildState()', $preview->skipped['i-lost']);
+
+        $result = $lb->cleanupOrphans(false);
+        self::assertSame(['i-dup'], self::ids($result->terminated));
+        self::assertSame(['i-lost'], array_keys($result->skipped));
+        self::assertSame(['terminate i-dup'], $this->aws->callsMatching('terminate'));
+        self::assertSame(Instance::RUNNING, $this->aws->instances['i-lost']->status);
+        $this->t->app->lock('tick')->release();
+    }
+
+    public function testCleanupDeletesNothingWhenDnsCannotBeRead(): void
+    {
+        $this->t->app->orphanTracker()->track(true);
+        $this->t->clock->advance(900);
+        $this->t->network->route53->denied = true;
+        $lb = $this->t->lb(['aws' => $this->aws]);
+
+        $result = $lb->cleanupOrphans(false);
+
+        self::assertSame([], $result->orphans);
+        self::assertSame(['i-dup', 'i-lost'], array_keys($result->skipped));
+        self::assertStringContainsString('读不到 DNS 记录', $result->skipped['i-dup']);
+        self::assertSame([], $this->aws->callsMatching('terminate'));
         $this->t->app->lock('tick')->release();
     }
 

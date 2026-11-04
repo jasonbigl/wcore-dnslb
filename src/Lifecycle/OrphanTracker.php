@@ -109,7 +109,8 @@ final class OrphanTracker
             $this->events->warning(
                 'orphan_instance',
                 sprintf(
-                    '实例 %s（%s/%s）带有本服务的标签，但已超过 %d 分钟没有节点引用，仍在计费。确认后用 Dnslb::cleanupOrphans() 删除',
+                    '实例 %s（%s/%s）带有本服务的标签，但已超过 %d 分钟没有节点引用，仍在计费。确认是本服务遗留的再用 Dnslb::cleanupOrphans() 删除；'
+                    . '如果同一云账号里有另一套部署使用了相同的服务名，这可能是它的机器，不要删除',
                     $orphan->instanceId,
                     $orphan->provider,
                     $orphan->region,

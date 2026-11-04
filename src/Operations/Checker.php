@@ -5,6 +5,7 @@ namespace Wcore\Dnslb\Operations;
 use Wcore\Dnslb\Application;
 use Wcore\Dnslb\Config\LaunchSpec;
 use Wcore\Dnslb\Config\ProviderConfig;
+use Wcore\Dnslb\Provider\Instance;
 use Wcore\Dnslb\State\Node;
 
 /**
@@ -52,6 +53,7 @@ final class Checker
 
         $this->checkDns();
         $this->checkProviders();
+        $this->checkServiceName();
         $this->checkMetrics();
         $this->checkNotify();
 
@@ -102,6 +104,58 @@ final class Checker
                 });
             }
         }
+    }
+
+    /**
+     * 云上带本服务标签、但状态库和本服务的 DNS 记录里都没有的实例：可能是孤儿，也可能是同一云账号里另一套部署用了相同的服务名
+     * （标签相同，孤儿清理和 rebuildState() 会把它的机器当成本服务的删除）。
+     */
+    private function checkServiceName(): void
+    {
+        $config = $this->app->config();
+        $name = '服务名冲突';
+        $known = [];
+        foreach ($this->app->nodes()->live() as $node) {
+            $known[$node->nodeId] = true;
+            if ($node->instanceId !== null) {
+                $known["{$node->provider}|{$node->instanceId}"] = true;
+            }
+        }
+        try {
+            $known += $this->app->dnsSync()->publishedNodeIds();
+        } catch (\Throwable $e) {
+            $this->report->add(CheckItem::WARN, $name, '读不到 DNS 记录，无法检查：' . $e->getMessage());
+            return;
+        }
+
+        $unknown = [];
+        foreach ($this->app->providers()->regionsByProvider() as $provider => $regions) {
+            try {
+                $instances = $this->app->providers()->get($provider)->listManaged($config->service, $regions);
+            } catch (\Throwable $e) {
+                $this->report->add(CheckItem::WARN, $name, "无法列出 {$provider} 的实例：{$e->getMessage()}");
+                continue;
+            }
+            foreach ($instances as $instance) {
+                if ($instance->status === Instance::GONE || isset($known["{$provider}|{$instance->id}"]) || isset($known[(string) $instance->nodeId])) {
+                    continue;
+                }
+                $unknown[] = "{$provider}/{$instance->region} {$instance->id}" . ($instance->nodeId !== null ? "（{$instance->nodeId}）" : '');
+            }
+        }
+        if ($unknown === []) {
+            $this->report->add(CheckItem::OK, $name, "带 dnslb:service={$config->service} 标签的实例都属于本服务");
+            return;
+        }
+        $this->report->add(CheckItem::WARN, $name, sprintf(
+            '%d 台带 dnslb:service=%s 标签的实例既不在状态库、也不在 %s 的 DNS 记录中：%s。'
+            . '如果是同一云账号里另一套部署使用了相同的服务名，请给本服务换一个名字，否则孤儿清理和 rebuildState() 会把它们当成本服务的机器删除；'
+            . '如果是本服务遗留的孤儿，用 Dnslb::cleanupOrphans() 预览后删除',
+            count($unknown),
+            $config->service,
+            $config->dns->name,
+            implode('、', array_slice($unknown, 0, 5)) . (count($unknown) > 5 ? ' 等' : '')
+        ));
     }
 
     private function checkMetrics(): void

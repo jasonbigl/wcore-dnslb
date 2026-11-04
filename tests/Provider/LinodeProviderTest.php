@@ -103,6 +103,33 @@ final class LinodeProviderTest extends TestCase
         self::assertSame('{"label":"web-tokyo-abc123"}', $this->transport->lastRequest()->header('X-Filter'));
     }
 
+    public function testFindByNodeIdOnlyAcceptsInstancesTaggedForTheNodesService(): void
+    {
+        $this->transport->queue(
+            new Response(200, [], (string) json_encode(['data' => [self::instance(['tags' => ['team-web']])], 'page' => 1, 'pages' => 1])),
+            new Response(200, [], (string) json_encode(['data' => [self::instance(['tags' => ['dnslb:service=web-tokyo', 'dnslb:pool=abc123']])], 'page' => 1, 'pages' => 1])),
+            new Response(200, [], (string) json_encode(['data' => [self::instance(['tags' => ['dnslb:service=web', 'dnslb:pool=osaka']])], 'page' => 1, 'pages' => 1])),
+            new Response(200, [], (string) json_encode(['data' => [self::instance()], 'page' => 1, 'pages' => 1]))
+        );
+
+        self::assertNull($this->provider->findByNodeId('ap-northeast', 'web-tokyo-abc123'), 'manually created Linode with the same label');
+        self::assertNull($this->provider->findByNodeId('ap-northeast', 'web-tokyo-abc123'), 'another service whose name is a prefix of the node ID');
+        self::assertNull($this->provider->findByNodeId('ap-northeast', 'web-tokyo-abc123'), 'pool tag does not match the node ID');
+        self::assertSame('12345', $this->provider->findByNodeId('ap-northeast', 'web-tokyo-abc123')->id);
+    }
+
+    public function testCreateDoesNotAdoptAForeignLinodeWithTheSameLabel(): void
+    {
+        $this->transport->queue(
+            new Response(400, [], '{"errors":[{"field":"label","reason":"Label must be unique among your Linodes"}]}'),
+            new Response(200, [], (string) json_encode(['data' => [self::instance(['tags' => []])], 'page' => 1, 'pages' => 1]))
+        );
+
+        $this->expectException(ProviderException::class);
+        $this->expectExceptionMessage('Label must be unique');
+        $this->provider->create($this->spec, 'web-tokyo-abc123', '', []);
+    }
+
     public function testOtherErrorsAreRaised(): void
     {
         $this->transport->queue(new Response(400, [], '{"errors":[{"field":"type","reason":"A valid plan type by that ID was not found"}]}'));
@@ -179,7 +206,7 @@ final class LinodeProviderTest extends TestCase
             'status' => 'running',
             'ipv4' => ['203.0.113.5'],
             'ipv6' => '2600:3c01::1/128',
-            'tags' => ['dnslb:service=web'],
+            'tags' => ['dnslb:service=web', 'dnslb:pool=tokyo'],
             'created' => '2026-10-19T08:00:00',
         ];
     }

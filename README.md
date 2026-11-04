@@ -74,6 +74,7 @@ composer require wcore/dnslb:dev-main
 
 复制 [examples/config.php](examples/config.php)（Route 53）或 [examples/config-cloudflare.php](examples/config-cloudflare.php)（Cloudflare），每个服务（域名）一个配置文件，例如 `/etc/dnslb/web.php`。示例中每一项都有注释。要点：
 
+- `service`：服务名，在同一个云账号内必须唯一，不同环境用不同的名字（如 `collector-staging`）。dnslb 按 `dnslb:service=<服务名>` 标签认领云上的实例，两套部署用同一个名字时会互相把对方的机器当成自己的：孤儿清理和 `rebuildState()` 会删除对方的机器。`check()` 会列出带本服务标签、但状态库和本服务 DNS 中都没有的实例。
 - `pools`：`launch` 按顺序列出建机方式，前一种被明确拒绝（容量不足、配额等）自动用下一种；结果未知（超时、限流、5xx）时先在同一方式上确认，2 分钟后仍查不到实例才换下一种，避免在两处各建一台。使用 Route 53 时每个池对应一个 AWS 区域（`latency_region`，Linode 机房映射到地理上最近的 AWS 区域）；使用 Cloudflare 时不需要 `latency_region`，池只用于分区域建机和扩缩容。
 - `scaling.metrics`：PromQL 查询必须按节点返回，并带 `node_id` 标签，例如 `... by (node_id)`。
 - `user_data.template`：cloud-init 模板，参考 [examples/cloud-init.yaml](examples/cloud-init.yaml)。内置占位符 `{{node_id}}`、`{{service}}`、`{{pool}}`、`{{provider}}`、`{{region}}`、`{{latency_region}}`，其余在 `user_data.vars` 中定义。节点需要把指标带上 `node_id` 标签上报。
@@ -144,7 +145,7 @@ $lb = Dnslb::fromConfigFile('/etc/dnslb/web.php', ['logger' => $psrLogger]);   /
 | `cancelRollout(?string $pool = null)` | — | 停止发布；已开始的替换继续完成，其余旧节点保持不变 |
 | `pause(?string $pool = null)` / `resume(?string $pool = null)` | — | 暂停 / 恢复自动增删机器（维护时用；健康检查和 DNS 摘除照常）。`resume` 同时解除连续启动失败造成的自动暂停；`$pool` 为 null 时作用于所有池 |
 | `rebuildState(bool $dryRun = false)` | `RebuildResult` | 状态库丢失后，根据云上实例和 DNS 记录重建，并记录 `state_rebuilt` 事件。`restored` 为恢复的节点，`warnings` 为需要确认的情况 |
-| `cleanupOrphans(bool $dryRun = true)` | `OrphanCleanupResult` | 删除孤儿实例：云上带本服务标签、但连续 15 分钟没有节点引用的实例（tick 每 10 分钟检查并告警，`status()` 的 `orphans` 中列出）。**默认只预览**，`orphans` 为孤儿列表；传 false 删除，`terminated` / `failed` 为结果。状态库从备份恢复后先 `rebuildState()`，不要直接删除 |
+| `cleanupOrphans(bool $dryRun = true)` | `OrphanCleanupResult` | 删除孤儿实例：云上带本服务标签、但连续 15 分钟没有节点引用的实例（tick 每 10 分钟检查并告警，`status()` 的 `orphans` 中列出）。**默认只预览**，`orphans` 为将要删除的孤儿；传 false 删除，`terminated` / `failed` 为结果。节点仍在 DNS 中（状态库里却没有这个在线节点）、或读不到 DNS 记录时不删除，列在 `skipped`（实例 ID => 原因）。状态库从备份恢复后先 `rebuildState()`，不要直接删除 |
 | `app()` | `Application` | 底层组件（高级用法），例如 `$lb->app()->nodes()->live()` |
 
 - 节点对象（`Wcore\Dnslb\State\Node`）的常用属性：`nodeId`、`pool`、`state`、`provider`、`providerRegion`、`instanceId`、`ipv4`、`ipv6`、`lastError`。
@@ -274,6 +275,9 @@ $preview = $lb->cleanupOrphans();
 foreach ($preview->orphans as $orphan) {
     $this->line("{$orphan->provider}/{$orphan->region} {$orphan->instanceId}（节点 ID {$orphan->nodeId}）");
 }
+foreach ($preview->skipped as $instanceId => $reason) {
+    $this->warn("{$instanceId} 不会删除：{$reason}");
+}
 if ($preview->orphans !== [] && $this->confirm('确认删除这些实例？')) {
     $result = $lb->cleanupOrphans(false);
     foreach ($result->failed as $instanceId => $error) {
@@ -295,7 +299,7 @@ if ($preview->orphans !== [] && $this->confirm('确认删除这些实例？')) {
 | `health_check.interval` | 10 | 每轮间隔（秒） |
 | `health_check.fall` / `rise` | 3 / 2 | 连续失败多少次摘除 / 连续成功多少次加回 |
 | `health_check.global_freeze_ratio` | 0.5 | 同一轮超过该比例的在线节点失败时冻结，不摘除任何节点。只有 1 台在线节点时不判断 |
-| `health_check.pool_failover_after` | 180 | 仅 Route 53：整池故障持续多久后撤下该区域，流量转到其他区域。Cloudflare 下整池故障时直接撤下，由其他池承接 |
+| `health_check.pool_failover_after` | 180 | 仅 Route 53：整池故障持续多久后撤下该区域，流量转到其他区域，撤下时记录 `pool_withdrawn` 事件（不发邮件，`status()` 的最近事件中可见）。Cloudflare 下整池故障时直接撤下，由其他池承接 |
 | `warmup.timeout` | 900 | 从建机到上线的最长时间 |
 | `drain.min` / `drain.max` | 300 / 1800 | 排空时间，从确认节点已不在 DNS 中时算起：配置了 `drain.idle` 时，过了 min 且流量低于阈值即可删除；否则等满 max |
 | `autoheal.unhealthy_for` | 300 | 在线节点持续不健康多久后替换 |
@@ -315,6 +319,7 @@ if ($preview->orphans !== [] && $this->confirm('确认删除这些实例？')) {
 - **DNS 负载均衡生效慢**：新节点只能接到新解析的流量，已缓存 IP 的客户端在 TTL 内（部分运营商 DNS 更久）仍访问旧节点。扩容要留出冷却时间，缩容依靠排空期覆盖缓存。
 - **单探测点**：健康检查只从控制器一个位置发起。金丝雀地址检测探测机自身网络，全局冻结防止探测机线路问题导致大面积误摘；代价是同一轮超过半数节点真实故障时，故障节点会留在 DNS 中，需要人工介入（见下方「后续迭代」）。
 - **单节点服务**：整个服务只有 1 台在线节点时，比例保护没有意义（任何故障都是 100%），因此不冻结、也不判定为系统性故障。节点故障时记录保留（没有其他节点可切），持续 `autoheal.unhealthy_for` 后建替补，替补上线后再排空旧节点。探测机到节点的线路故障也会触发替换：替补通常同样通不过检查，旧节点保留在 DNS 中；连续 `max_warmup_failures` 台失败后该池暂停建机并告警。2 台及以上时照常保护（两台同时故障仍会冻结）。
+- **实例被停止或删除**（控制台关机、宿主机故障等）：在线节点视为丢失，立即从 DNS 摘除并建替补（`node_lost` 告警）。已停止的实例确认摘除后再保留 `drain.max` 才删除，避免公网 IP 释放后被分配给别人时，缓存了旧记录的用户访问到别人的机器（EC2 停机时自动分配的公网 IPv4 已经释放，只有 IPv6 受保护）。需要维护时用 `drain()`，不要直接关机。
 - **IMDSv2**：EC2 实例强制使用 IMDSv2，cloud-init 脚本读取实例元数据时需要先申请令牌。
 - **按指标不会缩容到 0 台**：缩容前会预测剩余节点的负载，剩 0 台时预测不成立。
 - **容量到顶**：已达到 max 而指标仍持续超过扩容阈值时，发出 `scale_at_max` 告警（每个池每小时最多一次），需要人来决定调大 max 还是换用更大的机型。

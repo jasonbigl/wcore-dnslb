@@ -187,6 +187,53 @@ final class HealthCheckerTest extends TestCase
         self::assertSame('node_recovered: 节点 IPv4 健康检查恢复（故障期间一直保留在 DNS 中）', $this->events()[2], 'recovered within pool_failover_after');
     }
 
+    public function testPoolStaysDownAfterItsOnlyNodeIsLostUntilTheReplacementServes(): void
+    {
+        $this->t = new TestApp(['dns' => ['ipv6' => false]]);
+        $this->t->addNode('web-tokyo-a', 'tokyo', Node::IN_SERVICE, '10.0.0.1');
+        $this->t->addNode('web-fra-a', 'frankfurt', Node::IN_SERVICE, '10.0.1.1');
+        $this->t->network->unreachable['10.0.0.1'] = true;
+        $this->round();
+        $downAt = $this->t->clock->now();
+        $this->round();
+        self::assertSame($downAt, $this->t->app->pools()->get('tokyo')->downSince('v4'));
+
+        // tick 发现实例已停止：节点转入排空，替补启动中
+        $this->setState('web-tokyo-a', Node::DRAINING);
+        $this->t->addNode('web-tokyo-r', 'tokyo', Node::BOOTING, null);
+        $this->round();
+        $this->round();
+        self::assertSame($downAt, $this->t->app->pools()->get('tokyo')->downSince('v4'), 'no serving node yet: still down');
+        self::assertNotContains('pool_recovered', $this->t->eventTypes());
+
+        $this->t->clock->advance(240);
+        $replacement = $this->t->node('web-tokyo-r');
+        $replacement->ipv4 = '10.0.0.9';
+        $replacement->transition(Node::IN_SERVICE, $this->t->clock->now());
+        $this->t->app->nodes()->save($replacement, $this->t->clock->now());
+        $recoveredAt = $this->t->clock->now();
+        $this->round();
+
+        self::assertNull($this->t->app->pools()->get('tokyo')->downSince('v4'));
+        self::assertSame('pool_recovered: 池 IPv4 已恢复（中断 ' . ($recoveredAt - $downAt) . ' 秒）', $this->events()[2]);
+    }
+
+    public function testPoolDownEndsWhenAPoolWithMinZeroHasNoNodesLeft(): void
+    {
+        $this->t = new TestApp(['dns' => ['ipv6' => false], 'pools' => ['tokyo' => ['min' => 0]]]);
+        $this->t->addNode('web-tokyo-a', 'tokyo', Node::IN_SERVICE, '10.0.0.1');
+        $this->t->addNode('web-fra-a', 'frankfurt', Node::IN_SERVICE, '10.0.1.1');
+        $this->t->network->unreachable['10.0.0.1'] = true;
+        $this->round();
+        $this->round();
+
+        $this->setState('web-tokyo-a', Node::DRAINING);
+        $this->round();
+
+        self::assertNull($this->t->app->pools()->get('tokyo')->downSince('v4'));
+        self::assertSame('pool_recovered: 池 IPv4 已没有节点（min 为 0，也没有待上线的节点），结束整池故障状态（持续 10 秒）', $this->events()[2]);
+    }
+
     public function testCloudflareWithdrawsAFailedPoolAtOnce(): void
     {
         $this->t = new TestApp(['dns' => ['ipv6' => false]], true);
@@ -229,6 +276,13 @@ final class HealthCheckerTest extends TestCase
         return array_reverse(array_map(static function ($event): string {
             return "{$event->type}: {$event->message}";
         }, $this->t->app->events()->recent(100)));
+    }
+
+    private function setState(string $nodeId, string $state): void
+    {
+        $node = $this->t->node($nodeId);
+        $node->transition($state, $this->t->clock->now());
+        $this->t->app->nodes()->save($node, $this->t->clock->now());
     }
 
     private function round()

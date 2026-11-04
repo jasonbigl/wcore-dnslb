@@ -243,6 +243,72 @@ final class ReconcilerTest extends TestCase
         self::assertCount(1, $this->aws->callsMatching('create'), 'replacement created to keep min');
     }
 
+    public function testStoppedServingNodeLeavesDnsBeforeItsInstanceIsDeleted(): void
+    {
+        $this->t = $this->app([
+            'metric_sources' => ['prom' => ['url' => 'https://prom.test']],
+            'drain' => ['min' => 300, 'max' => 1800, 'idle' => ['source' => 'prom', 'query' => 'rps', 'below' => 1]],
+        ]);
+        $prom = new \Wcore\Dnslb\Tests\Support\FakeMetricSource();
+        $this->t->app->metrics()->set('prom', $prom);
+        [$a] = $this->serving(2);
+        $this->t->app->dnsSync()->sync();
+        $instanceId = (string) $this->node($a)->instanceId;
+        $this->aws->instances[$instanceId]->status = Instance::STOPPED;
+
+        $this->tick(false);
+
+        // 删除实例会释放公网 IP：DNS 缓存过期前保留实例
+        self::assertSame(Node::DRAINING, $this->node($a)->state);
+        self::assertSame([], $this->aws->callsMatching('terminate'));
+        self::assertCount(1, $this->aws->callsMatching('create'), 'replacement created to keep min');
+        $lost = $this->t->app->events()->recent(10);
+        $lost = array_values(array_filter($lost, static function ($event): bool {
+            return $event->type === 'node_lost';
+        }));
+        self::assertSame('实例已停止，从 DNS 摘除；确认摘除后保留实例 1800 秒（等 DNS 缓存过期，避免 IP 被他人复用）再删除', $lost[0]->message);
+
+        $this->t->clock->advance(600);
+        $this->tick(false);
+        self::assertNull($this->node($a)->dnsRemovedAt, 'records still in Route 53');
+
+        $this->t->app->dnsSync()->sync();
+        $this->tick(false);
+        self::assertSame($this->t->clock->now(), $this->node($a)->dnsRemovedAt);
+
+        // 停机后没有流量，但这不说明客户端缓存已过期：不按空闲指标提前删除，等满 drain.max
+        $prom->results['rps'] = [$a => 0.0];
+        $this->t->clock->advance(1799);
+        $this->t->app->metrics()->clearCache();
+        $this->tick(false);
+        self::assertSame(Node::DRAINING, $this->node($a)->state);
+
+        $this->t->clock->advance(1);
+        $this->tick(false);
+        self::assertSame(Node::TERMINATED, $this->node($a)->state);
+        self::assertContains("terminate {$instanceId}", $this->aws->calls);
+    }
+
+    public function testStoppedLastNodeKeepsItsRecordUntilAnotherNodeCanBePublished(): void
+    {
+        [$a] = $this->serving(1);
+        $this->t->app->dnsSync()->sync();
+        $this->aws->instances[(string) $this->node($a)->instanceId]->status = Instance::STOPPED;
+
+        $this->tick(false);
+        $this->t->app->dnsSync()->sync();
+        $this->t->clock->advance(600);
+        $this->tick(false);
+
+        $events = array_values(array_filter($this->t->app->events()->recent(10), static function ($event): bool {
+            return $event->type === 'node_lost';
+        }));
+        self::assertStringContainsString('DNS 记录暂时保留（见 dns_empty_held），摘除后保留实例 1800 秒再删除', $events[0]->message);
+        self::assertSame(Node::DRAINING, $this->node($a)->state);
+        self::assertNull($this->node($a)->dnsRemovedAt, 'EmptyPublishGuard keeps the only record');
+        self::assertSame([], $this->aws->callsMatching('terminate'));
+    }
+
     public function testListFailureNeverMarksNodesLost(): void
     {
         [$a] = $this->serving(2);

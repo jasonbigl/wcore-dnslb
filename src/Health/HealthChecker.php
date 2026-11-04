@@ -373,16 +373,33 @@ final class HealthChecker
                     $changed = true;
                     $this->events->critical('pool_down', $this->poolDownMessage($name, $family, $candidates, $nodes), $name);
                 } elseif (!$down && $state->downSince($family) !== null) {
+                    // 故障中在线节点都没了（例如唯一的节点丢失、转入排空），替补还没上线：池仍然不可用，有健康节点才算恢复
+                    if ($candidates === 0 && $this->expectsNodes($name, $pool->min)) {
+                        continue;
+                    }
                     $downFor = $now - (int) $state->downSince($family);
                     $state->setDownSince($family, null);
                     $changed = true;
-                    $this->events->info('pool_recovered', "池 {$label} 已恢复（中断 {$downFor} 秒）", $name);
+                    // 没有节点时也要发恢复事件，否则已发出的 pool_down 一直未恢复，之后同一池再次故障会被限频
+                    $message = $candidates === 0
+                        ? "池 {$label} 已没有节点（min 为 0，也没有待上线的节点），结束整池故障状态（持续 {$downFor} 秒）"
+                        : "池 {$label} 已恢复（中断 {$downFor} 秒）";
+                    $this->events->info('pool_recovered', $message, $name);
                 }
             }
             if ($changed) {
                 $this->pools->saveHealth($state);
             }
         }
+    }
+
+    /**
+     * 没有在线节点的池是否还应该有节点：min 大于 0，或有节点正在建机、启动、预热（例如替补）。
+     * 读状态库而不是本轮的节点快照：快照里没有建机、启动中的节点。
+     */
+    private function expectsNodes(string $pool, int $min): bool
+    {
+        return $min > 0 || $this->nodes->byStates([Node::PROVISIONING, Node::BOOTING, Node::WARMING], $pool) !== [];
     }
 
     /**
