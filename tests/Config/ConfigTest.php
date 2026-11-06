@@ -19,8 +19,10 @@ final class ConfigTest extends TestCase
         self::assertSame('web', $config->service);
         self::assertSame('/var/lib/dnslb/web.sqlite', $config->statePath);
         self::assertSame("{$examples}/cloud-init.yaml", $config->userData->template);
-        self::assertSame('Z0123456789ABCDEFGHIJ', $config->dns->zoneId);
-        self::assertSame('tokyo.pool.app.example.com', $config->dns->poolRecordName('tokyo'));
+        self::assertSame(['app.example.com', '*.example.net'], $config->dns->names());
+        self::assertSame('tokyo.dnslb-pool.example.net', $config->dns->zones['*.example.net']->poolRecordName('tokyo'));
+        self::assertSame('Z0123456789ABCDEFGHIJ', $config->dns->firstZone()->zoneId);
+        self::assertSame('tokyo.pool.app.example.com', $config->dns->firstZone()->poolRecordName('tokyo'));
         self::assertSame(DnsConfig::ROUTING_MULTIVALUE, $config->dns->poolRouting);
         self::assertTrue($config->dns->ipv6);
         self::assertSame('app.example.com', $config->healthCheck->host);
@@ -50,6 +52,7 @@ final class ConfigTest extends TestCase
 
         self::assertTrue($config->dns->isCloudflare());
         self::assertTrue($config->dns->proxied);
+        self::assertSame(['api.example.com', 'api.example.net'], $config->dns->names());
         self::assertSame('api.example.com', $config->healthCheck->host);
         self::assertSame(['dallas', 'newark'], array_keys($config->pools));
         self::assertNull($config->pools['dallas']->latencyRegion);
@@ -59,7 +62,7 @@ final class ConfigTest extends TestCase
     {
         $config = Config::fromArray($this->minimal(), $this->templateDir());
 
-        self::assertSame('{pool}.pool.app.example.com', $config->dns->poolDomain);
+        self::assertSame('{pool}.pool.app.example.com', $config->dns->firstZone()->poolDomain);
         self::assertSame(60, $config->dns->ttl);
         self::assertFalse($config->dns->ipv6);
         self::assertSame('https', $config->healthCheck->scheme);
@@ -85,11 +88,11 @@ final class ConfigTest extends TestCase
 
         $config = Config::fromArray($data, $this->templateDir());
 
-        self::assertTrue($config->dns->wildcard);
-        self::assertSame('*.example.net', $config->dns->name);
-        self::assertSame('tokyo.dnslb-pool.example.net', $config->dns->poolRecordName('tokyo'));
+        self::assertTrue($config->dns->firstZone()->wildcard);
+        self::assertSame(['*.example.net'], $config->dns->names());
+        self::assertSame('tokyo.dnslb-pool.example.net', $config->dns->firstZone()->poolRecordName('tokyo'));
         self::assertSame('health.example.net', $config->healthCheck->host);
-        self::assertFalse(Config::fromArray($this->minimal(), $this->templateDir())->dns->wildcard);
+        self::assertFalse(Config::fromArray($this->minimal(), $this->templateDir())->dns->firstZone()->wildcard);
     }
 
     public function testWildcardDomainRequiresConcreteHealthHost(): void
@@ -139,7 +142,7 @@ final class ConfigTest extends TestCase
     {
         $data = $this->minimal();
         $data['dns']['zone_id'] = '/hostedzone/ZABC';
-        self::assertSame('ZABC', Config::fromArray($data, $this->templateDir())->dns->zoneId);
+        self::assertSame('ZABC', Config::fromArray($data, $this->templateDir())->dns->firstZone()->zoneId);
     }
 
     public function testCollectsAllErrors(): void
@@ -204,7 +207,7 @@ final class ConfigTest extends TestCase
         $config = Config::fromArray($data, $this->templateDir());
 
         self::assertTrue($config->dns->isCloudflare());
-        self::assertSame('0123456789abcdef0123456789abcdef', $config->dns->zoneId);
+        self::assertSame('0123456789abcdef0123456789abcdef', $config->dns->firstZone()->zoneId);
         self::assertTrue($config->dns->proxied);
         self::assertSame(60, $config->dns->ttl);
         self::assertSame('CF-TOKEN', $config->cloudflareToken);
@@ -308,6 +311,86 @@ final class ConfigTest extends TestCase
         $this->expectException(ConfigException::class);
         $this->expectExceptionMessage('user_data.template: file not readable');
         Config::fromArray($data, $this->templateDir());
+    }
+
+    public function testMultipleZones(): void
+    {
+        $data = $this->minimal();
+        $data['dns'] = ['ipv6' => true, 'zones' => [
+            ['zone_id' => '/hostedzone/Z1', 'name' => 'App.Example.com.'],
+            ['zone_id' => 'Z2', 'name' => '*.example.net', 'pool_domain' => '{pool}.lb.example.net'],
+            ['zone_id' => 'Z3', 'name' => '*.example.org'],
+        ]];
+        $config = Config::fromArray($data, $this->templateDir());
+
+        self::assertSame(['app.example.com', '*.example.net', '*.example.org'], $config->dns->names());
+        self::assertSame('app.example.com、*.example.net、*.example.org', $config->dns->nameList());
+        $zones = $config->dns->zones;
+        self::assertSame('Z1', $zones['app.example.com']->zoneId);
+        self::assertFalse($zones['app.example.com']->wildcard);
+        self::assertSame('tokyo.pool.app.example.com', $zones['app.example.com']->poolRecordName('tokyo'));
+        self::assertTrue($zones['*.example.net']->wildcard);
+        self::assertSame('tokyo.lb.example.net', $zones['*.example.net']->poolRecordName('tokyo'));
+        self::assertSame('tokyo.dnslb-pool.example.org', $zones['*.example.org']->poolRecordName('tokyo'));
+        self::assertTrue($config->dns->ipv6);
+        self::assertSame('app.example.com', $config->healthCheck->host, 'health checks default to the first zone');
+    }
+
+    public function testFirstZoneWildcardRequiresHealthHost(): void
+    {
+        $data = $this->minimal();
+        $data['dns'] = ['zones' => [
+            ['zone_id' => 'Z2', 'name' => '*.example.net'],
+            ['zone_id' => 'Z1', 'name' => 'app.example.com'],
+        ]];
+        $this->expectExceptionMessage('health_check.host: is required when dns.name is a wildcard (with dns.zones: the name of the first zone)');
+        Config::fromArray($data, $this->templateDir());
+    }
+
+    /**
+     * @dataProvider invalidZones
+     */
+    public function testInvalidZones(array $dns, string $error, bool $cloudflare = false): void
+    {
+        $data = $this->minimal();
+        if ($cloudflare) {
+            $data['cloudflare'] = ['api_token' => 't'];
+            unset($data['pools']['tokyo']['latency_region']);
+        }
+        $data['dns'] = $dns;
+        try {
+            Config::fromArray($data, $this->templateDir());
+            self::fail('Expected ConfigException');
+        } catch (ConfigException $e) {
+            self::assertStringContainsString($error, $e->getMessage());
+        }
+    }
+
+    public function invalidZones(): array
+    {
+        $a = ['zone_id' => 'Z1', 'name' => 'app.example.com'];
+        $b = ['zone_id' => 'Z2', 'name' => 'app.example.net'];
+        $cf = '0123456789abcdef0123456789abcdef';
+        return [
+            'combined with name' => [['name' => 'x.example.com', 'zones' => [$a]], 'dns.name: cannot be combined with zones'],
+            'combined with pool_domain' => [['pool_domain' => '{pool}.x.example.com', 'zones' => [$a]], 'dns.pool_domain: cannot be combined with zones'],
+            'empty list' => [['zones' => []], 'dns.zones: must be a non-empty list'],
+            'not a list' => [['zones' => ['a' => $a]], 'dns.zones: must be a non-empty list'],
+            'missing name' => [['zones' => [['zone_id' => 'Z1']]], 'dns.zones.0.name: is required'],
+            'duplicate name' => [['zones' => [$a, ['zone_id' => 'Z2', 'name' => 'APP.example.com.']]], 'dns.zones.1.name: "app.example.com" is already used by another zone'],
+            'duplicate pool domain' => [
+                ['zones' => [$a + ['pool_domain' => '{pool}.lb.example.com'], $b + ['pool_domain' => '{pool}.lb.example.com']]],
+                'dns.zones.1.pool_domain: "{pool}.lb.example.com" is already used by zone "app.example.com"',
+            ],
+            'unknown key' => [['zones' => [$a + ['ttl' => 30]]], 'dns.zones.0.ttl: unknown option'],
+            'invalid name' => [['zones' => [$a, ['zone_id' => 'Z2', 'name' => 'a.*.example.net']]], 'dns.zones.1.name: invalid domain name'],
+            'cloudflare zone id' => [['provider' => 'cloudflare', 'zones' => [['zone_id' => 'Z1', 'name' => 'app.example.com']]], 'dns.zones.0.zone_id', true],
+            'cloudflare pool domain' => [
+                ['provider' => 'cloudflare', 'zones' => [['zone_id' => $cf, 'name' => 'app.example.com', 'pool_domain' => '{pool}.x.example.com']]],
+                'dns.zones.0.pool_domain: is not used with provider cloudflare',
+                true,
+            ],
+        ];
     }
 
     private function minimal(): array

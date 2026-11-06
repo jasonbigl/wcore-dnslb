@@ -6,19 +6,21 @@ use Wcore\Dnslb\Aws\Route53\Change;
 use Wcore\Dnslb\Aws\Route53\RecordSet;
 use Wcore\Dnslb\Aws\Route53\Route53Client;
 use Wcore\Dnslb\Config\Config;
+use Wcore\Dnslb\Config\DnsZone;
 use Wcore\Dnslb\Operations\CheckItem;
 use Wcore\Dnslb\Support\Clock;
 use Wcore\Dnslb\Support\FileLock;
 use Wcore\Dnslb\Support\Logger;
 
 /**
- * 把 Route 53 同步到 Route53Planner 计算出的期望状态（按延迟就近选择池，池内多值 / 加权）。
+ * 把一个区域在 Route 53 上的记录同步到 Route53Planner 计算出的期望状态（按延迟就近选择池，池内多值 / 加权）。
+ * 多个区域时每个区域一个实例，由 MultiZoneSync 依次同步。
  *
  * 在锁内重新读取数据库计算期望记录，再读取 Route 53 实际记录，只提交差异。没有可以发布的节点时保留现有记录（见 EmptyPublishGuard），
  * 接管后对外域名上又出现其他记录时告警（见 ForeignRecordTracker）。
  *
  * 只管理以下记录：
- * - dns.name 下 SetIdentifier 以 "dnslb-" 开头的 latency Alias 记录；
+ * - 对外名称下 SetIdentifier 以 "dnslb-" 开头的 latency Alias 记录；
  * - 各池记录名下 SetIdentifier 以 "{service}-" 开头的 A / AAAA 记录（即节点 ID）。
  */
 final class Route53Sync implements DnsSync
@@ -27,6 +29,7 @@ final class Route53Sync implements DnsSync
     private const MAX_CHANGES_PER_BATCH = 300;
 
     private Config $config;
+    private DnsZone $zone;
     private Route53Client $route53;
     private Route53Planner $planner;
     private FileLock $lock;
@@ -38,6 +41,7 @@ final class Route53Sync implements DnsSync
 
     public function __construct(
         Config $config,
+        DnsZone $zone,
         Route53Client $route53,
         Route53Planner $planner,
         FileLock $lock,
@@ -48,6 +52,7 @@ final class Route53Sync implements DnsSync
         Logger $logger
     ) {
         $this->config = $config;
+        $this->zone = $zone;
         $this->route53 = $route53;
         $this->planner = $planner;
         $this->lock = $lock;
@@ -61,7 +66,7 @@ final class Route53Sync implements DnsSync
     public function sync(bool $dryRun = false): SyncResult
     {
         return $this->lock->synchronized(function () use ($dryRun): SyncResult {
-            $name = $this->config->dns->name;
+            $name = $this->zone->name;
             $desired = $this->planner->plan($this->clock->now());
             [$actual, $foreign] = $this->fetchRecords();
 
@@ -110,7 +115,7 @@ final class Route53Sync implements DnsSync
     public function takeover(bool $dryRun = false): SyncResult
     {
         return $this->lock->synchronized(function () use ($dryRun): SyncResult {
-            $name = $this->config->dns->name;
+            $name = $this->zone->name;
             $desired = $this->planner->plan($this->clock->now());
             [$actual, $foreign] = $this->fetchRecords();
 
@@ -160,7 +165,7 @@ final class Route53Sync implements DnsSync
 
     public function check(): array
     {
-        $dns = $this->config->dns;
+        $dns = $this->zone;
         $items = [];
         try {
             $zone = $this->route53->getHostedZone($dns->zoneId);
@@ -205,9 +210,9 @@ final class Route53Sync implements DnsSync
 
         $ids = [];
         foreach (array_chunk($changes, self::MAX_CHANGES_PER_BATCH) as $batch) {
-            $ids[] = $this->route53->changeRecordSets($this->config->dns->zoneId, $batch, "dnslb {$this->config->service}");
+            $ids[] = $this->route53->changeRecordSets($this->zone->zoneId, $batch, "dnslb {$this->config->service}");
         }
-        $this->logger->info('DNS changes submitted', ['changes' => count($changes), 'change_ids' => $ids]);
+        $this->logger->info('DNS changes submitted', ['name' => $this->zone->name, 'changes' => count($changes), 'change_ids' => $ids]);
         $this->withdrawals->submitted($changes);
         return new SyncResult($changes, $ids, false);
     }
@@ -240,7 +245,7 @@ final class Route53Sync implements DnsSync
      */
     public function fetchRecords(): array
     {
-        $dns = $this->config->dns;
+        $dns = $this->zone;
         $owned = [];
         $foreign = [];
 
@@ -274,7 +279,7 @@ final class Route53Sync implements DnsSync
                 } elseif ($isConfigured) {
                     throw new DnsConflictException(
                         "{$record->name} already has a {$record->type} record not managed by dnslb; "
-                        . 'pool record names must be dedicated to dnslb (see dns.pool_domain)'
+                        . 'pool record names must be dedicated to dnslb (see pool_domain)'
                     );
                 }
             }

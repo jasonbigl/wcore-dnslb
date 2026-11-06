@@ -45,7 +45,8 @@ final class Reconciler
     private NodeRepository $nodes;
     private PoolRepository $pools;
     private DnsSync $dnsSync;
-    private ForeignRecordTracker $foreignRecords;
+    /** @var ForeignRecordTracker[] 各区域的外来记录跟踪 */
+    private array $foreignRecords;
     private EventRecorder $events;
     private Clock $clock;
     private Logger $logger;
@@ -62,6 +63,9 @@ final class Reconciler
     private ?array $nodesInDns = null;
     private bool $dnsUnavailable = false;
 
+    /**
+     * @param ForeignRecordTracker[] $foreignRecords 各区域的外来记录跟踪
+     */
     public function __construct(
         Config $config,
         ProviderRegistry $providers,
@@ -69,7 +73,7 @@ final class Reconciler
         NodeRepository $nodes,
         PoolRepository $pools,
         DnsSync $dnsSync,
-        ForeignRecordTracker $foreignRecords,
+        array $foreignRecords,
         EventRecorder $events,
         Clock $clock,
         Logger $logger,
@@ -329,16 +333,34 @@ final class Reconciler
                 $this->pools->save($state);
             }
             $age = $now - $node->createdAt;
-            $message = $this->foreignRecords->takeoverPending()
-                ? "节点通过健康检查（从创建到上线 {$age} 秒）。{$this->config->dns->name} 上还有不由 dnslb 管理的记录，调用 Dnslb::takeover() 接管之前不会接到流量"
-                : "节点通过健康检查，加入 DNS（从创建到上线 {$age} 秒）";
-            $this->events->info('node_in_service', $message, $node->pool, $node->nodeId);
+            $this->events->info('node_in_service', $this->inServiceMessage($age), $node->pool, $node->nodeId);
             return;
         }
         if ($now - $node->createdAt > $this->config->warmupTimeout) {
             $error = $node->v4->error ?? $node->v6->error ?? ($node->probedAt === null ? '健康检查尚未执行（Dnslb::health() 是否在定时运行？）' : '健康检查未通过');
             $this->warmupFailed($node, "健康检查一直未通过：{$error}");
         }
+    }
+
+    /**
+     * 按各区域是否还在等待接管说明节点会不会接到流量。
+     */
+    private function inServiceMessage(int $age): string
+    {
+        $pending = [];
+        foreach ($this->foreignRecords as $tracker) {
+            if ($tracker->takeoverPending()) {
+                $pending[] = $tracker->name();
+            }
+        }
+        if ($pending === []) {
+            return "节点通过健康检查，加入 DNS（从创建到上线 {$age} 秒）";
+        }
+        $names = implode('、', $pending);
+        if (count($pending) === count($this->foreignRecords)) {
+            return "节点通过健康检查（从创建到上线 {$age} 秒）。{$names} 上还有不由 dnslb 管理的记录，调用 Dnslb::takeover() 接管之前不会接到流量";
+        }
+        return "节点通过健康检查，加入 DNS（从创建到上线 {$age} 秒）。{$names} 上还有不由 dnslb 管理的记录，接管之前这些名称的流量不会到达节点";
     }
 
     private function checkServing(Node $node): void

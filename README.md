@@ -8,7 +8,7 @@
 - 按 Prometheus 兼容指标（Grafana Cloud 等）自动扩缩容，节点在 Linode / AWS EC2 上通过 cloud-init 自动部署
 - 缩容先从 DNS 摘除，排空一段时间后再删除机器，避免 DNS 缓存导致用户访问到已删除的节点
 - 自动修复故障节点，SES 邮件告警，心跳推送用于监控控制器本身
-- 支持通配符域名（如 `*.example.com`）、IPv6、从现有记录无中断切换
+- 支持通配符域名（如 `*.example.com`）、多个域名（同一批节点发布到多个区域）、IPv6、从现有记录无中断切换
 
 设计细节见 [docs/design.md](docs/design.md)。
 
@@ -29,6 +29,8 @@ api.example.com（或 *.example.com）   每个健康节点一条 A / AAAA 记�
 ```
 
 开启代理时，用户连接最近的 Cloudflare 边缘，边缘在这些记录中随机选择节点回源，失败时自动重试其他节点。
+
+配置了多个域名（`dns.zones`）时，每个域名各有一套上面的记录，发布同一批节点，各自同步（见「编写配置」中的多个域名）。
 
 控制器运行在一台常驻的小机器上（EC2 或 Linode 均可），通过 PHP 调用本包。由调度器（例如 Laravel scheduler）每分钟调用两个方法：
 
@@ -61,24 +63,42 @@ composer require wcore/dnslb:dev-main
 
 ### 1. 准备凭证
 
-- **AWS**：创建一个 IAM 用户，使用 [docs/iam-policy.json](docs/iam-policy.json) 中的最小权限策略（把 `ZONE_ID`、`ACCOUNT_ID`、`SERVICE`、`SES_REGION` 替换成实际值）。
+- **AWS**：创建一个 IAM 用户，使用 [docs/iam-policy.json](docs/iam-policy.json) 中的最小权限策略（把 `ZONE_ID`、`ACCOUNT_ID`、`SERVICE`、`SES_REGION` 替换成实际值；发布到多个托管区域时，Route 53 那一段的 `Resource` 列出每个区域）。
   - EC2 只能创建带 `dnslb:service=<服务名>` 标签的实例，也只能删除带这个标签的实例。
   - 配置了 `iam_instance_profile` 时，还需要对该角色的 `iam:PassRole` 权限。
   - `route53:TestDNSAnswer` 只有 `tools/verify-route53.php` 用到。
-- **Cloudflare**（使用 Cloudflare DNS 时）：创建 API 令牌，只授予该区域的 `Zone - DNS - Edit` 和 `Zone - Zone - Read`。
+- **Cloudflare**（使用 Cloudflare DNS 时）：创建 API 令牌，只授予用到的区域 `Zone - DNS - Edit` 和 `Zone - Zone - Read`。
 - **Linode**：创建 Personal Access Token，权限：Linodes 读写、Images 只读；使用 `firewall_id` 时还需要 Firewalls 读写。
 - **Grafana Cloud**：一个只读 token（控制器查询指标）和一个只写 token（节点上报指标、控制器推送心跳）。
 - **SES**：验证发件域名或地址，并申请移出沙箱（否则只能发给已验证的地址）。
 
 ### 2. 编写配置
 
-复制 [examples/config.php](examples/config.php)（Route 53）或 [examples/config-cloudflare.php](examples/config-cloudflare.php)（Cloudflare），每个服务（域名）一个配置文件，例如 `/etc/dnslb/web.php`。示例中每一项都有注释。要点：
+复制 [examples/config.php](examples/config.php)（Route 53）或 [examples/config-cloudflare.php](examples/config-cloudflare.php)（Cloudflare），每个服务（一批节点，可以发布到一个或多个域名）一个配置文件，例如 `/etc/dnslb/web.php`。示例中每一项都有注释。要点：
 
 - `service`：服务名，在同一个云账号内必须唯一，不同环境用不同的名字（如 `collector-staging`）。dnslb 按 `dnslb:service=<服务名>` 标签认领云上的实例，两套部署用同一个名字时会互相把对方的机器当成自己的：孤儿清理和 `rebuildState()` 会删除对方的机器。`check()` 会列出带本服务标签、但状态库和本服务 DNS 中都没有的实例。
 - `pools`：`launch` 按顺序列出建机方式，前一种被明确拒绝（容量不足、配额等）自动用下一种；结果未知（超时、限流、5xx）时先在同一方式上确认，2 分钟后仍查不到实例才换下一种，避免在两处各建一台。使用 Route 53 时每个池对应一个 AWS 区域（`latency_region`，Linode 机房映射到地理上最近的 AWS 区域）；使用 Cloudflare 时不需要 `latency_region`，池只用于分区域建机和扩缩容。
 - `scaling.metrics`：PromQL 查询必须按节点返回，并带 `node_id` 标签，例如 `... by (node_id)`。
 - `user_data.template`：cloud-init 模板，参考 [examples/cloud-init.yaml](examples/cloud-init.yaml)。内置占位符 `{{node_id}}`、`{{service}}`、`{{pool}}`、`{{provider}}`、`{{region}}`、`{{latency_region}}`，其余在 `user_data.vars` 中定义。节点需要把指标带上 `node_id` 标签上报。
 - 通配符域名：`dns.name` 写成 `'*.example.com'`，并必须配置 `health_check.host` 为一个通配符覆盖的具体域名（用于 SNI 和 Host 头）。
+- 多个域名：同一批节点要发布到多个域名（可以在不同的托管区域）时，用 `dns.zones` 代替 `zone_id` / `name`：
+  ```php
+  'dns' => [
+      'zones' => [
+          ['zone_id' => 'Z0123456789ABCDEFGHIJ', 'name' => '*.example.com'],
+          ['zone_id' => 'Z9876543210JIHGFEDCBA', 'name' => '*.example.net'],   // Route 53 还可以写 pool_domain
+      ],
+      'ttl' => 60,
+      'ipv6' => true,
+  ],
+  ```
+  - 所有区域使用同一个 `dns.provider` 和同一份凭证（AWS 密钥或 Cloudflare 令牌要有每个区域的权限）。`ttl`、`ipv6`、`pool_routing`、`proxied` 对所有区域生效。
+  - 每个区域各有一整套记录：Route 53 的 latency 记录只能指向同一托管区域内的记录，所以池记录也是每个区域一份，`pool_domain` 默认按各自的 `name` 生成。
+  - 各区域依次同步、互不影响：一个区域的接口出错时其他区域照常更新，下一轮重试（`tick` 记一条 `dns_sync_failed`，消息中带出错的区域）。节点要从所有区域都摘除后才开始排空计时，任何一个区域读不到记录时都延后删除机器。
+  - 接管、外来记录告警、保留记录（`dns_empty_held`）按区域分别处理，邮件中写明是哪个名称，各区域分别限频。`status()` 的 `dns.zones` 列出各区域，以及是否还在等待接管（`takeover_pending`）。
+  - `health_check.host` 默认取第一个区域的 `name`（它是通配符时必须配置）。节点证书要覆盖所有域名。
+  - 每次同步每个区域都要读取 1 + 池数个名称，Route 53 接口每个账号限 5 次/秒（遇到限流会退避重试），区域很多时同步会慢一些。
+  - 从配置里删除区域之前，要先手动删除它的记录，见「注意事项」。
 - 凭证建议通过 `getenv()` 读取，不要提交到代码仓库。
 
 ### 3. 检查与演练
@@ -110,6 +130,7 @@ $lb->takeover();                                      // 替换现有记录，�
 - 未开启 IPv6（`dns.ipv6 = false`）时，旧的 AAAA 记录也会被删除：保留的话双栈客户端会优先走 IPv6，继续访问旧服务器。之后只有纯 IPv6 的客户端无法访问（Cloudflare 代理模式下边缘本身提供 IPv6，不受影响）。预览时请确认要删除的记录。
 - Cloudflare：先添加节点记录，等待几秒传播后再删除旧的 A / AAAA 记录，期间新旧记录一起轮询。旧记录是 CNAME 时（不能与 A 记录并存）只能在同一批次中先删后增，各边缘节点可能有几秒不一致。
 - 接管后记录 `dns_takeover` 事件。之后名称下又出现不由 dnslb 管理的记录时（它们会与节点一起分到流量），发出一次 `dns_foreign_records` 告警，删除后收到恢复通知。
+- 多个域名时，`takeover()` 依次处理所有区域（没有外来记录的区域只做普通同步），每个区域单独提交。只接管其中一个时传入它的名称：`$lb->takeover(true, '*.example.net')` 预览，`$lb->takeover(false, '*.example.net')` 执行。还没接管的区域照常发布池记录（Route 53），节点上线事件会说明哪些名称在接管前不会把流量带到节点。
 
 ### 6. 监控控制器本身
 
@@ -137,7 +158,7 @@ $lb = Dnslb::fromConfigFile('/etc/dnslb/web.php', ['logger' => $psrLogger]);   /
 | `health(int $duration = 55, bool $once = false, bool $dryRun = false)` | `int` | 每分钟调度：每 `health_check.interval` 秒一轮健康检查，返回完成的轮数 |
 | `status()` | `array` | 各池、节点状态和最近事件（只读本地状态库），结构见 `Operations\StatusReport` |
 | `check()` | `CheckReport` | 校验配置和外部服务（只读）。`items` 为检查项（`status` 为 ok / warn / fail、`name`、`message`），`passed()` 表示没有失败项 |
-| `takeover(bool $dryRun = false)` | `SyncResult` | 无中断地接管对外域名上的现有记录。`changes` 为变更列表（`describe()` 可读描述），`changeIds` 为 Route 53 变更 ID（Cloudflare 为空） |
+| `takeover(bool $dryRun = false, ?string $name = null)` | `SyncResult` | 无中断地接管对外域名上的现有记录。多个域名时默认处理所有区域，传 `$name` 只接管其中一个。`changes` 为变更列表（`describe()` 可读描述），`changeIds` 为 Route 53 变更 ID（Cloudflare 为空） |
 | `scale(string $pool, int $delta, bool $dryRun = false)` | `ScaleResult` | 手动扩缩容。`requested` / `allowed`（受 min / max 限制后的台数，缩容后剩下的健康节点也不少于 min）、`created` / `failed` / `drained` 为节点列表 |
 | `drain(string $nodeId, bool $dryRun = false)` | `Node` | 立即从 DNS 摘除并排空指定节点 |
 | `replace(string $nodeId, bool $dryRun = false)` | `Node` | 先建替补（返回替补节点），上线后排空指定节点 |
@@ -291,10 +312,12 @@ if ($preview->orphans !== [] && $this->confirm('确认删除这些实例？')) {
 | 配置 | 默认值 | 说明 |
 |---|---|---|
 | `dns.provider` | route53 | `route53`：按延迟就近；`cloudflare`：所有池的节点轮询（需要 `cloudflare.api_token`，池不配置 `latency_region`） |
+| `dns.zone_id` / `dns.name` | 必填（或用 `dns.zones`） | 托管区域 ID 和对外域名（可以是通配符） |
+| `dns.zones` | — | 多个域名：`[['zone_id' => ..., 'name' => ..., 'pool_domain' => ...], ...]`，所有区域发布同一批节点。不能与 `dns.zone_id` / `dns.name` / `dns.pool_domain` 同时使用 |
 | `dns.ttl` | 60 | 节点记录 TTL。Cloudflare 代理记录固定为自动，仅 DNS 时最小 60（企业版 30） |
 | `dns.ipv6` | false | 全局 IPv6 开关；开启后每个节点都必须有 IPv6，探测机也必须有 IPv6 出口。Cloudflare 代理模式下客户端始终可用 IPv6 访问边缘，节点不需要 IPv6 |
 | `dns.pool_routing` | multivalue | 仅 Route 53。`multivalue`：每次返回最多 8 个 IP，客户端可自行重试；`weighted`：按 `launch[].weight` 加权，每次返回 1 个 |
-| `dns.pool_domain` | `{pool}.pool.<name>`（通配符时 `{pool}.dnslb-pool.<base>`） | 仅 Route 53。池记录名，必须专用于 dnslb |
+| `dns.pool_domain` | `{pool}.pool.<name>`（通配符时 `{pool}.dnslb-pool.<base>`） | 仅 Route 53。池记录名，必须专用于 dnslb；多个域名时写在各区域中，不能重复 |
 | `dns.proxied` | true | 仅 Cloudflare。`true`：代理（橙云）；`false`：仅 DNS（灰云） |
 | `health_check.interval` | 10 | 每轮间隔（秒） |
 | `health_check.fall` / `rise` | 3 / 2 | 连续失败多少次摘除 / 连续成功多少次加回 |
@@ -324,6 +347,9 @@ if ($preview->orphans !== [] && $this->confirm('确认删除这些实例？')) {
 - **按指标不会缩容到 0 台**：缩容前会预测剩余节点的负载，剩 0 台时预测不成立。
 - **容量到顶**：已达到 max 而指标仍持续超过扩容阈值时，发出 `scale_at_max` 告警（每个池每小时最多一次），需要人来决定调大 max 还是换用更大的机型。
 - **节点上报指标**必须带 `node_id` 标签。查询返回同一节点多条序列，或序列缺少 `node_id` 标签时，该指标视为不可用，不做决策。
+- **从 `dns.zones` 删除区域**（修改 `dns.name` 也一样）：dnslb 只管理配置中的区域，删掉的区域里的记录不会被清理，会一直指向当时的节点 IP。这些节点之后被删除时，dnslb 不会等它们从这个区域摘除，IP 被云厂商回收、分配给别人后，缓存或仍在解析这些记录的用户会访问到别人的机器。所以要先手动删除这个区域里 dnslb 的记录（或先把这个名称切到别处），再从配置中删除：
+  - Route 53：先删对外名称下 SetIdentifier 以 `dnslb-` 开头的 latency 记录，再删池记录名（`pool_domain`）下 SetIdentifier 以 `<服务名>-` 开头的记录。
+  - Cloudflare：删对外名称下备注以 `dnslb node <服务名>-` 开头的记录。
 - **改名或替换全部池**：建议先加新池，新节点上线后再删旧池。一次换掉全部池也不会断解析：没有可以发布的节点时，对外名称保留现有记录（发出 `dns_empty_held` 告警），旧节点继续服务到新节点上线后再切换。反过来，删掉全部池并不会让域名下线，记录和旧机器会一直保留，下线整个服务需要手动删除记录（删除后收到 `dns_empty_released`，排空开始计时，之后删除机器）。
 
 使用 Cloudflare 时：
@@ -348,6 +374,8 @@ docker run --rm -v "$PWD":/app -w /app php:7.4-cli vendor/bin/phpunit
 ```bash
 php tools/verify-route53.php --zone <ZoneId> --domain '*.dnslb-verify.example.com'
 php tools/verify-cloudflare.php --zone <区域 ID> --domain '*.dnslb-verify.example.com'
+# 多个区域：--zone / --domain 按顺序成对重复，每项检查在每个区域分别验证
+php tools/verify-route53.php --zone <ZoneId> --domain '*.dnslb-verify.example.com' --zone <ZoneId2> --domain '*.dnslb-verify.example.net'
 ```
 
 Cloudflare 的验证使用通配符名称时，还会通过 DoH（Cloudflare，无法访问时改用 Google）解析新的子域名，确认代理记录解析到 Cloudflare 边缘、仅 DNS 记录解析到节点地址。

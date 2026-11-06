@@ -69,7 +69,7 @@ final class Route53SyncTest extends TestCase
         $events = $t->app->events()->recent(10);
         self::assertSame('pool_withdrawn', $events[0]->type);
         self::assertSame('tokyo', $events[0]->pool);
-        self::assertSame('池 IPv4 整池故障 181 秒，已把该区域（ap-northeast-1）从 DNS 撤下，流量转到其他区域；恢复后自动重新发布', $events[0]->message);
+        self::assertSame('池 IPv4 整池故障 181 秒，已把该区域（ap-northeast-1）从 app.example.com 撤下，流量转到其他区域；恢复后自动重新发布', $events[0]->message);
 
         // 撤下只记录一次
         $t->clock->advance(60);
@@ -139,7 +139,7 @@ final class Route53SyncTest extends TestCase
         self::assertSame([], $t->eventTypes(), 'waiting for takeover is not an alert');
 
         $this->expectException(DnsConflictException::class);
-        $t->app->dnsSync()->fetchActual();
+        $t->app->dnsSync()->zone('app.example.com')->fetchActual();
     }
 
     public function testTakeoverReplacesForeignRecordsInOneBatch(): void

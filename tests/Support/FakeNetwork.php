@@ -7,13 +7,17 @@ use Wcore\Dnslb\Http\Request;
 use Wcore\Dnslb\Http\Response;
 
 /**
- * 模拟外部网络：Route 53 请求交给 FakeRoute53，Cloudflare 请求交给 FakeCloudflare，节点健康检查按 IP 返回预设结果，
- * 其余请求视为金丝雀。
+ * 模拟外部网络：Route 53 请求交给 FakeRoute53，Cloudflare 请求交给 FakeCloudflare（按区域 ID 分发，
+ * 默认区域之外的区域放在 route53Zones / cloudflareZones 中），节点健康检查按 IP 返回预设结果，其余请求视为金丝雀。
  */
 final class FakeNetwork
 {
     public FakeRoute53 $route53;
     public FakeCloudflare $cloudflare;
+    /** @var array<string,FakeRoute53> 其他托管区域：区域 ID => 区域 */
+    public array $route53Zones = [];
+    /** @var array<string,FakeCloudflare> 其他 Cloudflare 区域：区域 ID => 区域 */
+    public array $cloudflareZones = [];
     /** @var array<string,true> 不可达的节点 IP */
     public array $unreachable = [];
     /** @var array<string,int> 节点 IP => HTTP 状态码（默认 200） */
@@ -34,14 +38,27 @@ final class FakeNetwork
         $this->cloudflare = new FakeCloudflare();
     }
 
+    public function addRoute53Zone(string $zoneId, string $zoneName): FakeRoute53
+    {
+        return $this->route53Zones[$zoneId] = new FakeRoute53($zoneId, $zoneName);
+    }
+
+    public function addCloudflareZone(string $zoneId, string $zoneName): FakeCloudflare
+    {
+        return $this->cloudflareZones[$zoneId] = new FakeCloudflare($zoneId, $zoneName);
+    }
+
     public function __invoke(Request $request)
     {
         $host = (string) parse_url($request->url, PHP_URL_HOST);
+        $path = (string) parse_url($request->url, PHP_URL_PATH);
         if ($host === 'route53.amazonaws.com') {
-            return ($this->route53)($request);
+            $zone = preg_match('#/hostedzone/([^/]+)#', $path, $m) ? ($this->route53Zones[$m[1]] ?? null) : null;
+            return ($zone ?? $this->route53)($request);
         }
         if ($host === 'api.cloudflare.com') {
-            return ($this->cloudflare)($request);
+            $zone = preg_match('#/zones/([^/]+)#', $path, $m) ? ($this->cloudflareZones[$m[1]] ?? null) : null;
+            return ($zone ?? $this->cloudflare)($request);
         }
         if (preg_match('/^email\.[a-z0-9-]+\.amazonaws\.com$/', $host)) {
             if ($this->sesFails) {

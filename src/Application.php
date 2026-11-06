@@ -10,6 +10,7 @@ use Wcore\Dnslb\Dns\CloudflareSync;
 use Wcore\Dnslb\Dns\DnsSync;
 use Wcore\Dnslb\Dns\EmptyPublishGuard;
 use Wcore\Dnslb\Dns\ForeignRecordTracker;
+use Wcore\Dnslb\Dns\MultiZoneSync;
 use Wcore\Dnslb\Dns\NodeSelector;
 use Wcore\Dnslb\Dns\PoolWithdrawalTracker;
 use Wcore\Dnslb\Dns\Route53Planner;
@@ -163,38 +164,49 @@ final class Application
         return $this->instances[NodeSelector::class] ??= new NodeSelector($this->config, $this->nodes(), $this->pools());
     }
 
-    public function foreignRecords(): ForeignRecordTracker
+    /**
+     * 各区域的外来记录跟踪（对外名称 => 跟踪器）。
+     *
+     * @return array<string,ForeignRecordTracker>
+     */
+    public function foreignRecords(): array
     {
-        return $this->instances[ForeignRecordTracker::class] ??= new ForeignRecordTracker(
-            $this->config->dns->name,
-            $this->meta(),
-            $this->eventRecorder(),
-            $this->clock(),
-            $this->logger()
-        );
+        if (!isset($this->instances[ForeignRecordTracker::class])) {
+            $trackers = [];
+            foreach ($this->config->dns->names() as $name) {
+                $trackers[$name] = new ForeignRecordTracker($name, $this->meta(), $this->eventRecorder(), $this->clock(), $this->logger());
+            }
+            $this->instances[ForeignRecordTracker::class] = $trackers;
+        }
+        return $this->instances[ForeignRecordTracker::class];
     }
 
     /**
-     * 按 dns.provider 选择 Route53Sync 或 CloudflareSync。
+     * 按 dns.provider 为每个区域创建 Route53Sync 或 CloudflareSync，由 MultiZoneSync 依次同步。
      */
-    public function dnsSync(): DnsSync
+    public function dnsSync(): MultiZoneSync
     {
         if (!isset($this->instances[DnsSync::class])) {
-            $guard = new EmptyPublishGuard($this->config, $this->nodes(), $this->meta(), $this->eventRecorder(), $this->clock(), $this->logger());
             $foreign = $this->foreignRecords();
-            $this->instances[DnsSync::class] = $this->config->dns->isCloudflare()
-                ? new CloudflareSync($this->config, $this->cloudflare(), $this->nodeSelector(), $this->lock('dns'), $guard, $foreign, $this->clock(), $this->logger())
-                : new Route53Sync(
-                    $this->config,
-                    $this->route53(),
-                    new Route53Planner($this->config, $this->nodeSelector()),
-                    $this->lock('dns'),
-                    $guard,
-                    $foreign,
-                    new PoolWithdrawalTracker($this->config, $this->pools(), $this->eventRecorder(), $this->clock()),
-                    $this->clock(),
-                    $this->logger()
-                );
+            $zones = [];
+            foreach ($this->config->dns->zones as $name => $zone) {
+                $guard = new EmptyPublishGuard($name, $this->config, $this->nodes(), $this->meta(), $this->eventRecorder(), $this->clock(), $this->logger());
+                $zones[$name] = $this->config->dns->isCloudflare()
+                    ? new CloudflareSync($this->config, $zone, $this->cloudflare(), $this->nodeSelector(), $this->lock('dns'), $guard, $foreign[$name], $this->clock(), $this->logger())
+                    : new Route53Sync(
+                        $this->config,
+                        $zone,
+                        $this->route53(),
+                        new Route53Planner($this->config, $zone, $this->nodeSelector()),
+                        $this->lock('dns'),
+                        $guard,
+                        $foreign[$name],
+                        new PoolWithdrawalTracker($name, $this->config, $this->pools(), $this->eventRecorder(), $this->clock()),
+                        $this->clock(),
+                        $this->logger()
+                    );
+            }
+            $this->instances[DnsSync::class] = new MultiZoneSync($zones, $this->logger());
         }
         return $this->instances[DnsSync::class];
     }

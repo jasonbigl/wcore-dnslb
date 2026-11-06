@@ -19,6 +19,8 @@ final class FakeCloudflare
     public const ZONE_ID = '0123456789abcdef0123456789abcdef';
     public const TOKEN = 'CF-TOKEN';
 
+    /** 区域 ID（多区域测试时每个区域一个实例，见 FakeNetwork::$cloudflareZones） */
+    public string $zoneId = self::ZONE_ID;
     public string $zoneName = 'example.com';
     public string $zoneStatus = 'active';
     /** @var array<string,DnsRecord> id => 记录 */
@@ -29,6 +31,12 @@ final class FakeCloudflare
     /** 列表接口每页最多返回的条数（测试分页） */
     public int $maxPageSize = 1000;
     private int $sequence = 0;
+
+    public function __construct(string $zoneId = self::ZONE_ID, string $zoneName = 'example.com')
+    {
+        $this->zoneId = $zoneId;
+        $this->zoneName = $zoneName;
+    }
 
     public function add(DnsRecord $record): DnsRecord
     {
@@ -55,10 +63,10 @@ final class FakeCloudflare
         }
         $path = (string) parse_url($request->url, PHP_URL_PATH);
         $query = self::query((string) parse_url($request->url, PHP_URL_QUERY));
-        $zone = '/client/v4/zones/' . self::ZONE_ID;
+        $zone = '/client/v4/zones/' . $this->zoneId;
 
         if ($request->method === 'GET' && $path === $zone) {
-            return self::ok(['id' => self::ZONE_ID, 'name' => $this->zoneName, 'status' => $this->zoneStatus]);
+            return self::ok(['id' => $this->zoneId, 'name' => $this->zoneName, 'status' => $this->zoneStatus]);
         }
         if ($request->method === 'GET' && $path === "{$zone}/dns_records") {
             return $this->list($query);

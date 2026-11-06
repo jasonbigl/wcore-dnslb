@@ -55,7 +55,12 @@ final class OperationsTest extends TestCase
         $status = $t->lb()->status();
 
         self::assertSame('web', $status['service']);
-        self::assertSame(['provider' => 'route53', 'name' => 'app.example.com', 'routing' => 'multivalue', 'ipv6' => true], $status['dns']);
+        self::assertSame([
+            'provider' => 'route53',
+            'zones' => [['name' => 'app.example.com', 'zone_id' => 'Z1', 'takeover_pending' => false]],
+            'routing' => 'multivalue',
+            'ipv6' => true,
+        ], $status['dns']);
         self::assertSame([['flag' => 'frozen', 'family' => 'v4', 'since' => $t->clock->now() - 120]], $status['flags']);
 
         [$tokyo, $frankfurt] = $status['pools'];

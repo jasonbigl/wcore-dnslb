@@ -8,6 +8,7 @@ use Wcore\Dnslb\Provider\Instance;
 use Wcore\Dnslb\Dnslb;
 use Wcore\Dnslb\State\Node;
 use Wcore\Dnslb\Tests\Support\FakeProvider;
+use Wcore\Dnslb\Tests\Support\FakeCloudflare;
 use Wcore\Dnslb\Tests\Support\TestApp;
 
 /**
@@ -128,7 +129,12 @@ final class CloudflareEndToEndTest extends TestCase
         self::assertContains('Cloudflare 区域', $names);
         self::assertContains('Cloudflare 现有记录', $names);
         self::assertNotContains('Route 53 托管区域', $names);
-        self::assertSame(['provider' => 'cloudflare', 'name' => self::NAME, 'routing' => 'proxied', 'ipv6' => false], $this->lb->status()['dns']);
+        self::assertSame([
+            'provider' => 'cloudflare',
+            'zones' => [['name' => self::NAME, 'zone_id' => FakeCloudflare::ZONE_ID, 'takeover_pending' => false]],
+            'routing' => 'proxied',
+            'ipv6' => false,
+        ], $this->lb->status()['dns']);
     }
 
     public function testNodesComingUpBeforeTakeoverAreReportedAsNotServing(): void
@@ -151,7 +157,7 @@ final class CloudflareEndToEndTest extends TestCase
         );
 
         $this->lb->takeover();
-        self::assertFalse($this->t->app->foreignRecords()->takeoverPending(), 'cleared by the takeover itself, before the next sync');
+        self::assertFalse($this->t->app->foreignRecords()['app.example.com']->takeoverPending(), 'cleared by the takeover itself, before the next sync');
 
         $created = $this->lb->scale('tokyo', 1)->created[0];
         $this->aws->boot($created->nodeId, '10.0.0.9');

@@ -6,14 +6,15 @@ use Wcore\Dnslb\Cloudflare\CloudflareClient;
 use Wcore\Dnslb\Cloudflare\DnsRecord;
 use Wcore\Dnslb\Cloudflare\RecordChange;
 use Wcore\Dnslb\Config\Config;
+use Wcore\Dnslb\Config\DnsZone;
 use Wcore\Dnslb\Operations\CheckItem;
 use Wcore\Dnslb\Support\Clock;
 use Wcore\Dnslb\Support\FileLock;
 use Wcore\Dnslb\Support\Logger;
 
 /**
- * 把 Cloudflare 上 dns.name 的 A / AAAA 记录同步为 NodeSelector 选出的节点：所有池的节点在同一个名称下轮询，
- * 不区分区域。开启代理（橙云）时，Cloudflare 边缘随机选择节点回源，失败时自动重试其他节点。
+ * 把一个区域在 Cloudflare 上对外名称的 A / AAAA 记录同步为 NodeSelector 选出的节点：所有池的节点在同一个名称下轮询，
+ * 不区分区域。多个区域时每个区域一个实例，由 MultiZoneSync 依次同步。开启代理（橙云）时，Cloudflare 边缘随机选择节点回源，失败时自动重试其他节点。
  *
  * 由 dnslb 管理的记录用备注 "dnslb node {节点 ID}" 标识。同一名称上已有其他 A / AAAA / CNAME 记录时，
  * 在 takeover 之前不发布任何记录，接管后又出现时告警（见 ForeignRecordTracker）。
@@ -29,6 +30,7 @@ final class CloudflareSync implements DnsSync
     private const PROPAGATION_WAIT = 5;
 
     private Config $config;
+    private DnsZone $zone;
     private CloudflareClient $client;
     private NodeSelector $selector;
     private FileLock $lock;
@@ -39,6 +41,7 @@ final class CloudflareSync implements DnsSync
 
     public function __construct(
         Config $config,
+        DnsZone $zone,
         CloudflareClient $client,
         NodeSelector $selector,
         FileLock $lock,
@@ -48,6 +51,7 @@ final class CloudflareSync implements DnsSync
         Logger $logger
     ) {
         $this->config = $config;
+        $this->zone = $zone;
         $this->client = $client;
         $this->selector = $selector;
         $this->lock = $lock;
@@ -68,7 +72,7 @@ final class CloudflareSync implements DnsSync
                 // 尚未接管：不往别人的记录里混入节点
                 $this->logger->warning(sprintf(
                     '%s has %d record(s) not managed by dnslb; nothing is published there until Dnslb::takeover()',
-                    $this->config->dns->name,
+                    $this->zone->name,
                     count($foreign)
                 ));
                 $result = new SyncResult([], [], $dryRun);
@@ -90,7 +94,7 @@ final class CloudflareSync implements DnsSync
     public function takeover(bool $dryRun = false): SyncResult
     {
         return $this->lock->synchronized(function () use ($dryRun): SyncResult {
-            $name = $this->config->dns->name;
+            $name = $this->zone->name;
             $desired = $this->plan($this->clock->now());
             if ($desired === []) {
                 throw new \RuntimeException("No pool has in-service nodes yet; taking over {$name} now would leave it without records");
@@ -134,10 +138,10 @@ final class CloudflareSync implements DnsSync
         $dns = $this->config->dns;
         $items = [];
         try {
-            $zone = $this->client->getZone($dns->zoneId);
-            $name = ltrim($dns->name, '*.');
+            $zone = $this->client->getZone($this->zone->zoneId);
+            $name = ltrim($this->zone->name, '*.');
             if ($name !== $zone['name'] && substr($name, -strlen('.' . $zone['name'])) !== '.' . $zone['name']) {
-                throw new \RuntimeException("{$dns->name} 不在区域 {$zone['name']} 内");
+                throw new \RuntimeException("{$this->zone->name} 不在区域 {$zone['name']} 内");
             }
             if ($zone['status'] === 'active') {
                 $items[] = new CheckItem(CheckItem::OK, 'Cloudflare 区域', "{$zone['name']}（{$zone['id']}）");
@@ -157,7 +161,7 @@ final class CloudflareSync implements DnsSync
         $items[] = new CheckItem(CheckItem::OK, 'Cloudflare 现有记录', count($owned) . ' 条由 dnslb 管理（' . ($dns->proxied ? '代理' : '仅 DNS') . '）');
         if ($foreign !== []) {
             $list = implode('、', self::describeAll($foreign));
-            $items[] = new CheckItem(CheckItem::WARN, '待接管的记录', "{$dns->name} 上有 " . count($foreign) . " 条不由 dnslb 管理的记录（{$list}），节点上线后用 Dnslb::takeover() 无中断切换");
+            $items[] = new CheckItem(CheckItem::WARN, '待接管的记录', "{$this->zone->name} 上有 " . count($foreign) . " 条不由 dnslb 管理的记录（{$list}），节点上线后用 Dnslb::takeover() 无中断切换");
         }
         return $items;
     }
@@ -176,7 +180,7 @@ final class CloudflareSync implements DnsSync
                 foreach ($nodes as $node) {
                     $record = new DnsRecord(
                         NodeSelector::recordType($family),
-                        $dns->name,
+                        $this->zone->name,
                         (string) $node->ip($family),
                         $dns->proxied,
                         $dns->proxied ? DnsRecord::TTL_AUTO : $dns->ttl,
@@ -191,7 +195,7 @@ final class CloudflareSync implements DnsSync
     }
 
     /**
-     * 读取 dns.name 下由本服务管理的记录，以及不由 dnslb 管理、接管时需要替换的 A / AAAA / CNAME 记录。
+     * 读取对外名称下由本服务管理的记录，以及不由 dnslb 管理、接管时需要替换的 A / AAAA / CNAME 记录。
      *
      * @return array{0: DnsRecord[], 1: DnsRecord[]}
      */
@@ -200,7 +204,7 @@ final class CloudflareSync implements DnsSync
         $ownedPrefix = self::COMMENT_PREFIX . $this->config->service . '-';
         $owned = [];
         $foreign = [];
-        foreach ($this->client->listRecords($this->config->dns->zoneId, $this->config->dns->name) as $record) {
+        foreach ($this->client->listRecords($this->zone->zoneId, $this->zone->name) as $record) {
             if (!in_array($record->type, ['A', 'AAAA', 'CNAME'], true)) {
                 continue;
             }
@@ -293,7 +297,7 @@ final class CloudflareSync implements DnsSync
             $this->clock->sleep(self::PROPAGATION_WAIT * 1000000);
             $this->apply([], $deletes);
         }
-        $this->logger->info('DNS changes submitted', ['changes' => count($changes)]);
+        $this->logger->info('DNS changes submitted', ['name' => $this->zone->name, 'changes' => count($changes)]);
         return new SyncResult($changes, [], false);
     }
 
@@ -312,7 +316,7 @@ final class CloudflareSync implements DnsSync
                 $posts[] = $change->record;
             }
         }
-        $this->client->batch($this->config->dns->zoneId, array_map(static function (RecordChange $change): DnsRecord {
+        $this->client->batch($this->zone->zoneId, array_map(static function (RecordChange $change): DnsRecord {
             return $change->record;
         }, $deletes), $patches, $posts);
     }

@@ -26,7 +26,7 @@ final class StatusReport
     /**
      * @return array{
      *   service: string,
-     *   dns: array{provider: string, name: string, routing: string, ipv6: bool},
+     *   dns: array{provider: string, zones: array<array{name: string, zone_id: string, takeover_pending: bool}>, routing: string, ipv6: bool},
      *   flags: array<array{flag: string, family: string, since: int}>,
      *   pools: array<array<string,mixed>>,
      *   orphans: array<array{provider: string, region: string, instance_id: string, node_id: ?string, first_seen_at: int}>,
@@ -54,6 +54,17 @@ final class StatusReport
         $nodesByPool = [];
         foreach ($app->nodes()->live() as $node) {
             $nodesByPool[$node->pool][] = $node;
+        }
+
+        $zones = [];
+        $foreign = $app->foreignRecords();
+        foreach ($config->dns->zones as $name => $zone) {
+            $zones[] = [
+                'name' => $name,
+                'zone_id' => $zone->zoneId,
+                // 名称上有不由 dnslb 管理的记录、还没有接管（最近一次同步时的状态）
+                'takeover_pending' => $foreign[$name]->takeoverPending(),
+            ];
         }
 
         $pools = [];
@@ -108,7 +119,8 @@ final class StatusReport
             'service' => $config->service,
             'dns' => [
                 'provider' => $config->dns->provider,
-                'name' => $config->dns->name,
+                // 发布区域，按配置顺序；所有区域发布同一批节点
+                'zones' => $zones,
                 // Route 53：池内路由方式（multivalue / weighted）；Cloudflare：proxied / dns-only
                 'routing' => $config->dns->isCloudflare() ? ($config->dns->proxied ? 'proxied' : 'dns-only') : $config->dns->poolRouting,
                 'ipv6' => $config->dns->ipv6,

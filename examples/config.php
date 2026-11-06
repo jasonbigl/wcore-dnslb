@@ -1,7 +1,7 @@
 <?php
 
 /*
- * dnslb 配置示例。一个配置文件对应一个服务（一个域名）。
+ * dnslb 配置示例。一个配置文件对应一个服务（一批节点，可以发布到一个或多个域名）。
  * 相对路径以本文件所在目录为基准。
  */
 
@@ -34,12 +34,18 @@ return [
     'dns' => [
         // route53（默认）：按延迟就近解析到最近区域的池；cloudflare：所有池的节点轮询，见 config-cloudflare.php
         'provider' => 'route53',
-        'zone_id' => 'Z0123456789ABCDEFGHIJ',
-        // 对外服务的域名：每个池一条 latency 记录。也可以是通配符，如 '*.example.com'
-        // （此时 pool_domain 默认为 {pool}.dnslb-pool.example.com，并且必须配置 health_check.host）
-        'name' => 'app.example.com',
-        // 每个池的节点记录名，必须以 {pool}. 开头
-        'pool_domain' => '{pool}.pool.app.example.com',
+        // 发布区域：同一批节点发布到每个区域，每个区域各有一整套记录（latency 记录 + 池记录），各自同步。
+        // - zone_id：托管区域 ID（可以带 /hostedzone/ 前缀）。IAM 策略要包含每个托管区域
+        // - name：对外服务的域名，每个池一条 latency 记录。也可以是通配符，如 '*.example.net'
+        //   （第一个区域是通配符时必须配置 health_check.host）
+        // - pool_domain：可选，每个池的节点记录名，必须以 {pool}. 开头、专用于 dnslb，各区域不能重复。
+        //   默认 {pool}.pool.<name>，通配符时 {pool}.dnslb-pool.<去掉 *. 的 name>（如 {pool}.dnslb-pool.example.net）
+        // 只有一个区域时也可以不写 zones，直接写 'zone_id' => ..., 'name' => ..., 'pool_domain' => ...（两种写法不能同时使用）。
+        // 从 zones 删除区域前，先手动删除该区域里 dnslb 的记录（见 README「注意事项」）
+        'zones' => [
+            ['zone_id' => 'Z0123456789ABCDEFGHIJ', 'name' => 'app.example.com', 'pool_domain' => '{pool}.pool.app.example.com'],
+            ['zone_id' => 'Z9876543210JIHGFEDCBA', 'name' => '*.example.net'],
+        ],
         'ttl' => 60,
         // 全局 IPv6 开关：开启后每个节点都必须有 IPv6 地址，探测机也必须有 IPv6 出口
         'ipv6' => true,
@@ -51,7 +57,7 @@ return [
         'scheme' => 'https',
         'port' => 443,
         'path' => '/health',
-        'host' => 'app.example.com',            // SNI 与 Host 头，默认取 dns.name
+        'host' => 'app.example.com',            // SNI 与 Host 头，默认取第一个区域的 name；节点证书要覆盖所有区域的域名
         'verify_tls' => true,
         'expect_status' => [200, 299],
         'expect_body' => null,                  // 可选：响应中必须包含的字符串
@@ -66,7 +72,7 @@ return [
             'https://www.cloudflare.com/cdn-cgi/trace',
         ],
         'global_freeze_ratio' => 0.5,           // 超过一半节点同时失败：冻结 DNS 变更并告警
-        'pool_failover_after' => 180,           // 仅 Route 53：整池失败持续 180 秒后删除该区域 latency 记录
+        'pool_failover_after' => 180,           // 仅 Route 53：整池失败持续 180 秒后在每个区域删除该池的 latency 记录
     ],
 
     // 新节点最长预热时间（秒），超时视为失败并销毁

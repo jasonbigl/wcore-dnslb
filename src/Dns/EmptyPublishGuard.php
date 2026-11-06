@@ -13,12 +13,14 @@ use Wcore\Dnslb\Support\Logger;
  * 不把对外名称同步成没有记录：没有可以发布的节点（例如改名或替换了全部池、所有节点同时丢失）而现有记录不为空时，
  * 保留现有记录不动，等又有节点可以发布时再切换。仍在记录中的旧节点因此不会开始排空计时，会继续服务到切换完成。
  * 进入和解除时各记录一条事件；保留的记录被手动删除时也会解除（例如下线整个服务）。
+ * 每个区域一个实例，状态和事件按对外名称分开（事件的 context 带 dns_name，告警按名称分别限频）。
  */
 final class EmptyPublishGuard
 {
-    private const META_KEY = 'dns_empty_held';
+    private const META_KEY = 'dns_empty_held:';
 
     private string $name;
+    private string $key;
     private Config $config;
     private NodeRepository $nodes;
     private Meta $meta;
@@ -26,9 +28,10 @@ final class EmptyPublishGuard
     private Clock $clock;
     private Logger $logger;
 
-    public function __construct(Config $config, NodeRepository $nodes, Meta $meta, EventRecorder $events, Clock $clock, Logger $logger)
+    public function __construct(string $name, Config $config, NodeRepository $nodes, Meta $meta, EventRecorder $events, Clock $clock, Logger $logger)
     {
-        $this->name = $config->dns->name;
+        $this->name = $name;
+        $this->key = self::META_KEY . $name;
         $this->config = $config;
         $this->nodes = $nodes;
         $this->meta = $meta;
@@ -45,22 +48,23 @@ final class EmptyPublishGuard
     public function hold(bool $desiredEmpty, bool $publishedEmpty): bool
     {
         $now = $this->clock->now();
-        $since = $this->meta->get(self::META_KEY);
+        $since = $this->meta->get($this->key);
         if ($desiredEmpty && !$publishedEmpty) {
             if ($since === null) {
-                $this->meta->set(self::META_KEY, (string) $now);
-                $this->events->critical('dns_empty_held', $this->heldMessage());
+                $this->meta->set($this->key, (string) $now);
+                $this->events->critical('dns_empty_held', $this->heldMessage(), null, null, ['dns_name' => $this->name]);
             } else {
                 $this->logger->warning("No nodes to publish; keeping the existing records of {$this->name}", ['since' => (int) $since]);
             }
             return true;
         }
         if ($since !== null) {
-            $this->meta->delete(self::META_KEY);
+            $this->meta->delete($this->key);
             $message = $desiredEmpty
                 ? "{$this->name} 上保留的记录已被删除，名称下现在没有 dnslb 的记录（仍没有可以发布的节点）"
                 : "{$this->name} 已有节点可以发布，恢复正常同步";
             $this->events->info('dns_empty_released', $message, null, null, [
+                'dns_name' => $this->name,
                 'held_seconds' => $now - (int) $since,
             ]);
         }

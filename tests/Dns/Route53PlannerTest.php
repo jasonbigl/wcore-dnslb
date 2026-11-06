@@ -153,6 +153,6 @@ final class Route53PlannerTest extends TestCase
 
     private static function planner(TestApp $t): Route53Planner
     {
-        return new Route53Planner($t->config, $t->app->nodeSelector());
+        return new Route53Planner($t->config, $t->config->dns->firstZone(), $t->app->nodeSelector());
     }
 }

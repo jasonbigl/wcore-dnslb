@@ -6,23 +6,27 @@ use Wcore\Dnslb\Aws\Route53\AliasTarget;
 use Wcore\Dnslb\Aws\Route53\RecordSet;
 use Wcore\Dnslb\Config\Config;
 use Wcore\Dnslb\Config\DnsConfig;
+use Wcore\Dnslb\Config\DnsZone;
 use Wcore\Dnslb\Config\PoolConfig;
 use Wcore\Dnslb\State\Node;
 
 /**
- * 计算 Route 53 上应有的记录：NodeSelector 选出的节点发布到各池记录名下（第二层），
+ * 计算一个区域在 Route 53 上应有的记录：NodeSelector 选出的节点发布到各池记录名下（第二层），
  * 池内有记录时，才发布该区域的 latency Alias 记录（第一层）。
+ * Alias 只能指向同一托管区域内的记录，所以每个区域都有自己的池记录。
  */
 final class Route53Planner
 {
     public const LATENCY_ID_PREFIX = 'dnslb-';
 
     private Config $config;
+    private DnsZone $zone;
     private NodeSelector $selector;
 
-    public function __construct(Config $config, NodeSelector $selector)
+    public function __construct(Config $config, DnsZone $zone, NodeSelector $selector)
     {
         $this->config = $config;
+        $this->zone = $zone;
         $this->selector = $selector;
     }
 
@@ -66,7 +70,7 @@ final class Route53Planner
     private function nodeRecord(PoolConfig $pool, Node $node, string $family): RecordSet
     {
         $dns = $this->config->dns;
-        $name = $dns->poolRecordName($pool->name);
+        $name = $this->zone->poolRecordName($pool->name);
         $type = NodeSelector::recordType($family);
         $ip = (string) $node->ip($family);
         if ($dns->poolRouting === DnsConfig::ROUTING_WEIGHTED) {
@@ -77,13 +81,12 @@ final class Route53Planner
 
     private function latencyRecord(PoolConfig $pool, string $family): RecordSet
     {
-        $dns = $this->config->dns;
         return RecordSet::latencyAlias(
-            $dns->name,
+            $this->zone->name,
             NodeSelector::recordType($family),
             self::LATENCY_ID_PREFIX . $pool->name,
             (string) $pool->latencyRegion,
-            new AliasTarget($dns->zoneId, $dns->poolRecordName($pool->name), true)
+            new AliasTarget($this->zone->zoneId, $this->zone->poolRecordName($pool->name), true)
         );
     }
 }

@@ -1,7 +1,7 @@
 <?php
 
 /*
- * 使用 Cloudflare DNS 的配置示例：所有池的节点在同一个域名下轮询（不区分区域），开启代理（橙云）。
+ * 使用 Cloudflare DNS 的配置示例：所有池的节点在每个对外域名下轮询（不区分区域），开启代理（橙云）。
  * 适合不需要按区域就近访问、但需要健康检查和故障恢复的服务。
  * 这里只列出与 Route 53 不同的部分和最小必填项，其余配置（health_check、drain、autoheal、scaling、
  * notify、heartbeat 等）与 config.php 相同。
@@ -12,7 +12,7 @@ return [
     'service' => 'api',
     'state' => '/var/lib/dnslb/api.sqlite',
 
-    // Cloudflare API 令牌：只授予该区域的 Zone - DNS - Edit 和 Zone - Zone - Read
+    // Cloudflare API 令牌：只授予用到的区域 Zone - DNS - Edit 和 Zone - Zone - Read
     'cloudflare' => [
         'api_token' => getenv('DNSLB_CF_TOKEN') ?: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
     ],
@@ -24,10 +24,15 @@ return [
 
     'dns' => [
         'provider' => 'cloudflare',
-        // 区域 ID：Cloudflare 控制台中域名概览页右下角的 Zone ID
-        'zone_id' => '0123456789abcdef0123456789abcdef',
-        // 对外服务的域名，也可以是通配符 '*.example.com'（此时必须配置 health_check.host）
-        'name' => 'api.example.com',
+        // 发布区域：同一批节点发布到每个区域，各自同步（API 令牌需要每个区域的权限）。
+        // - zone_id：区域 ID，Cloudflare 控制台中域名概览页右下角的 Zone ID
+        // - name：对外服务的域名，也可以是通配符 '*.example.net'（第一个区域是通配符时必须配置 health_check.host）
+        // 只有一个区域时也可以不写 zones，直接写 'zone_id' => ..., 'name' => ...（两种写法不能同时使用）。
+        // 从 zones 删除区域前，先手动删除该区域里 dnslb 的记录（见 README「注意事项」）
+        'zones' => [
+            ['zone_id' => '0123456789abcdef0123456789abcdef', 'name' => 'api.example.com'],
+            ['zone_id' => 'fedcba9876543210fedcba9876543210', 'name' => 'api.example.net'],
+        ],
         // true（默认）：代理（橙云）。摘除节点几秒内生效，边缘回源失败会自动换其他节点重试；
         // 节点 IP 不暴露，节点需要放行 Cloudflare 的 IP 段，真实客户端 IP 从 CF-Connecting-IP 头读取。
         // false：仅 DNS（灰云），解析直接返回节点 IP，摘除受客户端 DNS 缓存影响
@@ -37,6 +42,7 @@ return [
         'ipv6' => false,
     ],
 
+    // host（SNI 与 Host 头）默认取第一个区域的 name；节点证书要覆盖所有区域的域名
     'health_check' => [
         'path' => '/health',
         'fall' => 3,

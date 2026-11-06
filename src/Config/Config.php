@@ -5,7 +5,7 @@ namespace Wcore\Dnslb\Config;
 use Wcore\Dnslb\Aws\Credentials;
 
 /**
- * 一个服务（一个域名）的完整配置。配置文件是返回数组的 PHP 文件。
+ * 一个服务的完整配置（一批节点，发布到一个或多个域名）。配置文件是返回数组的 PHP 文件。
  */
 final class Config
 {
@@ -86,7 +86,12 @@ final class Config
         }
 
         $c->dns = DnsConfig::fromSection($root->sectionOrEmpty('dns', true));
-        $c->healthCheck = HealthCheckConfig::fromSection($root->sectionOrEmpty('health_check'), $c->dns->wildcard ? null : $c->dns->name);
+        // 健康检查默认用第一个区域的名称；它是通配符时必须配置 host
+        $firstZone = $c->dns->firstZone();
+        $c->healthCheck = HealthCheckConfig::fromSection(
+            $root->sectionOrEmpty('health_check'),
+            $firstZone === null ? '' : ($firstZone->wildcard ? null : $firstZone->name)
+        );
 
         $warmup = $root->sectionOrEmpty('warmup');
         $warmup->allowOnly(['timeout']);

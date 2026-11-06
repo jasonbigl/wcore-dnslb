@@ -153,7 +153,7 @@ final class Checker
             . '如果是本服务遗留的孤儿，用 Dnslb::cleanupOrphans() 预览后删除',
             count($unknown),
             $config->service,
-            $config->dns->name,
+            $config->dns->nameList(),
             implode('、', array_slice($unknown, 0, 5)) . (count($unknown) > 5 ? ' 等' : '')
         ));
     }

@@ -67,6 +67,10 @@ final class TestApp
                 unset($base['pools'][$name]['latency_region']);
             }
         }
+        // 多区域写法不能与单区域的 zone_id / name 同时出现
+        if (isset($overrides['dns']['zones'])) {
+            unset($base['dns']['zone_id'], $base['dns']['name']);
+        }
         return Config::fromArray(array_replace_recursive($base, $overrides), (string) realpath(__DIR__ . '/../fixtures'));
     }
 
@@ -129,12 +133,13 @@ final class TestApp
     }
 
     /**
+     * @param FakeRoute53|null $zone 默认为 network->route53
      * @return string[] Route 53 上某个名称下记录的简要描述，如 "A web-tokyo-a 1.1.1.1"
      */
-    public function records(string $name): array
+    public function records(string $name, ?FakeRoute53 $zone = null): array
     {
         $result = [];
-        foreach ($this->network->route53->recordsNamed($name) as $record) {
+        foreach (($zone ?? $this->network->route53)->recordsNamed($name) as $record) {
             $value = $record->aliasTarget !== null ? '-> ' . $record->aliasTarget->dnsName : implode(',', $record->values);
             $result[] = "{$record->type} {$record->setIdentifier} {$value}";
         }

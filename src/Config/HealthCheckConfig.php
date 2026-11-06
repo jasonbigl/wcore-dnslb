@@ -30,7 +30,7 @@ final class HealthCheckConfig
     public int $poolFailoverAfter;
 
     /**
-     * @param string|null $defaultHost 默认的 SNI / Host；dns.name 为通配符时为 null，此时 host 必填
+     * @param string|null $defaultHost 默认的 SNI / Host（第一个区域的名称）；它是通配符时为 null，此时 host 必填
      */
     public static function fromSection(Section $s, ?string $defaultHost): self
     {
@@ -44,7 +44,7 @@ final class HealthCheckConfig
         $c->port = $s->int('port', $c->scheme === 'https' ? 443 : 80, 1, 65535);
         $c->path = $s->string('path', '/health', '#^/\S*$#');
         if ($defaultHost === null && !$s->has('host')) {
-            $s->error('host', 'is required when dns.name is a wildcard: set a concrete name covered by it, e.g. health.example.com (used for SNI and the Host header)');
+            $s->error('host', 'is required when dns.name is a wildcard (with dns.zones: the name of the first zone): set a concrete name covered by it, e.g. health.example.com (used for SNI and the Host header)');
         }
         $c->host = strtolower($s->string('host', $defaultHost ?? ''));
         if (strpos($c->host, '*') !== false) {

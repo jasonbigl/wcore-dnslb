@@ -14,7 +14,7 @@ use Wcore\Dnslb\Support\Logger;
  * 把待通知的事件合并成一封邮件发送（每个 tick 最多一封）。
  *
  * - 发送 warning / critical 事件，以及已告警问题的恢复通知；
- * - 同一告警（类型 + 池 + 节点）在 notify.throttle 秒内只发一次；
+ * - 同一告警（类型 + 池 + 节点，DNS 区域的告警再加对外名称）在 notify.throttle 秒内只发一次；
  * - 恢复通知与告警配对：对应告警发出过且还没有发过恢复时一定发送，不受限频影响；对应告警没有发出过时不发送。
  *   发出恢复通知后，同一对象再次故障立即告警；
  * - 发送失败时事件保持待发送，下个 tick 重试；超过一天仍未发出的不再发送。
@@ -117,9 +117,14 @@ final class Notifier
         $this->events->markNotified($handled);
     }
 
+    /**
+     * 类型 + 池 + 节点；DNS 区域的事件再加上对外名称（多个区域各自限频、各自配对恢复）。
+     */
     private static function alertKey(string $type, Event $event): string
     {
-        return implode('|', [$type, $event->pool ?? '', $event->nodeId ?? '']);
+        $key = implode('|', [$type, $event->pool ?? '', $event->nodeId ?? '']);
+        $name = $event->context['dns_name'] ?? null;
+        return is_string($name) && $name !== '' ? "{$key}|{$name}" : $key;
     }
 
     /**
@@ -142,7 +147,7 @@ final class Notifier
         }
         $subject = sprintf('%s %s %s%s', $notify->subjectPrefix, self::LEVEL_LABELS[$highest], $first, count($events) > 1 ? ' 等 ' . count($events) . ' 条' : '');
 
-        $lines = ["服务：{$this->config->service}（{$this->config->dns->name}）", ''];
+        $lines = ["服务：{$this->config->service}（{$this->config->dns->nameList()}）", ''];
         foreach ($events as $event) {
             $where = $event->pool ?? '';
             if ($event->nodeId !== null) {

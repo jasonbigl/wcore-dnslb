@@ -111,6 +111,45 @@ final class NotifierTest extends TestCase
         self::assertNull($this->t->app->alertLog()->lastSentAt('dns_empty_held||'), 'recovered: the next incident alerts at once');
     }
 
+    public function testDnsAlertsAreThrottledAndRecoveredPerZone(): void
+    {
+        $events = $this->t->app->eventRecorder();
+        $notifier = $this->t->app->notifier();
+        $com = ['dns_name' => 'app.example.com'];
+        $net = ['dns_name' => 'app.example.net'];
+
+        $events->warning('dns_foreign_records', 'app.example.com 上出现了 1 条不由 dnslb 管理的记录', null, null, $com);
+        $notifier->flush();
+        $this->t->clock->advance(60);
+        $events->warning('dns_foreign_records', 'app.example.net 上出现了 1 条不由 dnslb 管理的记录', null, null, $net);
+        $notifier->flush();
+        self::assertCount(2, $this->t->network->emails, 'the same alert in another zone is not throttled');
+
+        $this->t->clock->advance(60);
+        $events->info('dns_foreign_records_removed', 'app.example.com 上不由 dnslb 管理的记录已全部删除', null, null, $com);
+        $notifier->flush();
+        self::assertCount(3, $this->t->network->emails);
+        self::assertNull($this->t->app->alertLog()->lastSentAt('dns_foreign_records|||app.example.com'));
+        self::assertNotNull($this->t->app->alertLog()->lastSentAt('dns_foreign_records|||app.example.net'), 'recovering one zone keeps the other open');
+
+        $this->t->clock->advance(60);
+        $events->warning('dns_foreign_records', 'app.example.net 上出现了 1 条不由 dnslb 管理的记录', null, null, $net);
+        $notifier->flush();
+        self::assertCount(3, $this->t->network->emails, 'still throttled within its own zone');
+    }
+
+    public function testBodyListsEveryZone(): void
+    {
+        $t = new TestApp([
+            'notify' => ['region' => 'us-east-1', 'from' => 'lb@example.com', 'to' => ['ops@example.com']],
+            'dns' => ['zones' => [['zone_id' => 'Z1', 'name' => 'app.example.com'], ['zone_id' => 'Z2', 'name' => 'app.example.net']]],
+        ]);
+        $t->app->eventRecorder()->critical('pool_down', '池内全部节点均不健康', 'tokyo');
+        $t->app->notifier()->flush();
+
+        self::assertStringContainsString('服务：web（app.example.com、app.example.net）', $t->network->emails[0]['Content']['Simple']['Body']['Text']['Data']);
+    }
+
     public function testRecoveryIsOnlySentForAlertsThatWereSent(): void
     {
         $events = $this->t->app->eventRecorder();

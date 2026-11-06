@@ -119,12 +119,16 @@ final class Dnslb
      * Route 53：在同一个原子批次中用 latency 记录替换；Cloudflare：先添加节点记录，传播后再删除旧记录。
      * 建议先用 $dryRun = true 预览 changes，确认后再执行。
      *
+     * 多个区域时默认处理所有区域（没有外来记录的区域只做普通同步），各区域分别提交；$name 指定时只接管这一个区域。
+     *
+     * @param string|null $name 只接管这个对外名称（dns.zones 中的 name）
      * @throws \RuntimeException 还没有任何池有在线节点时拒绝接管
+     * @throws \InvalidArgumentException $name 不是配置的对外名称
      */
-    public function takeover(bool $dryRun = false): SyncResult
+    public function takeover(bool $dryRun = false, ?string $name = null): SyncResult
     {
         $app = $this->app('takeover', $dryRun);
-        return $app->dnsSync()->takeover($app->isDryRun());
+        return $app->dnsSync()->takeover($app->isDryRun(), $name);
     }
 
     /**
