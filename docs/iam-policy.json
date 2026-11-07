@@ -80,6 +80,17 @@
             }
         },
         {
+            "Sid": "Ec2ConsoleOutputOnlyOwnInstances",
+            "Effect": "Allow",
+            "Action": "ec2:GetConsoleOutput",
+            "Resource": "arn:aws:ec2:*:ACCOUNT_ID:instance/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/dnslb:service": "SERVICE"
+                }
+            }
+        },
+        {
             "Sid": "SesSend",
             "Effect": "Allow",
             "Action": "ses:SendEmail",

@@ -4,13 +4,15 @@ namespace Wcore\Dnslb\Health;
 
 use Wcore\Dnslb\Dns\DnsSync;
 use Wcore\Dnslb\Heartbeat\Heartbeat;
+use Wcore\Dnslb\Lifecycle\WarmingPromoter;
 use Wcore\Dnslb\Support\Clock;
 use Wcore\Dnslb\Support\FileLock;
 use Wcore\Dnslb\Support\Logger;
 
 /**
  * health 命令的主循环：cron 每分钟启动一次，进程内每 interval 秒执行一轮，
- * 运行约 duration 秒后退出。期望 DNS 发生变化时（以及每次启动的第一轮）执行 DnsSync。
+ * 运行约 duration 秒后退出。每轮：健康检查 → 把已通过检查的预热节点转为在线（拿到 tick 锁时，见 WarmingPromoter）
+ * → 期望 DNS 发生变化时（以及每次启动的第一轮）执行 DnsSync。
  */
 final class HealthRunner
 {
@@ -24,6 +26,7 @@ final class HealthRunner
     private Logger $logger;
     private int $interval;
     private ?Heartbeat $heartbeat;
+    private ?WarmingPromoter $promoter;
 
     public function __construct(
         HealthChecker $checker,
@@ -32,7 +35,8 @@ final class HealthRunner
         Clock $clock,
         Logger $logger,
         int $interval,
-        ?Heartbeat $heartbeat = null
+        ?Heartbeat $heartbeat = null,
+        ?WarmingPromoter $promoter = null
     ) {
         $this->checker = $checker;
         $this->dnsSync = $dnsSync;
@@ -41,6 +45,7 @@ final class HealthRunner
         $this->logger = $logger;
         $this->interval = $interval;
         $this->heartbeat = $heartbeat;
+        $this->promoter = $promoter;
     }
 
     /**
@@ -63,6 +68,7 @@ final class HealthRunner
                 $roundStart = $this->clock->now();
                 try {
                     $summary = $this->checker->runRound();
+                    $promoted = $dryRun ? [] : $this->promoteWarming();
                     $fingerprint = $this->dnsSync->desiredFingerprint($this->clock->now());
                     if ($fingerprint !== $lastFingerprint) {
                         $this->dnsSync->sync($dryRun);
@@ -74,7 +80,8 @@ final class HealthRunner
                         'failed' => $summary->failed,
                         'down' => $summary->becameUnhealthy,
                         'up' => $summary->becameHealthy,
-                    ] + ($summary->frozenFamilies ? ['frozen' => $summary->frozenFamilies] : [])
+                    ] + ($promoted ? ['in_service' => $promoted] : [])
+                      + ($summary->frozenFamilies ? ['frozen' => $summary->frozenFamilies] : [])
                       + ($summary->skippedFamilies ? ['canary_down' => $summary->skippedFamilies] : []));
                 } catch (\Throwable $e) {
                     // 本轮失败（例如 DNS 服务商暂时不可用）：下一轮重试，指纹未更新所以会再次同步
@@ -95,6 +102,24 @@ final class HealthRunner
             }
         } finally {
             $this->lock->release();
+        }
+    }
+
+    /**
+     * 出错不影响本轮（tick 会照常转换）。
+     *
+     * @return string[] 转为在线的节点 ID
+     */
+    private function promoteWarming(): array
+    {
+        if ($this->promoter === null) {
+            return [];
+        }
+        try {
+            return $this->promoter->run() ?? [];
+        } catch (\Throwable $e) {
+            $this->logger->error('Promoting warming nodes failed: ' . $e->getMessage(), ['exception' => get_class($e)]);
+            return [];
         }
     }
 

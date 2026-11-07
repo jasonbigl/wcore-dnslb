@@ -77,6 +77,50 @@ final class Route53ClientTest extends TestCase
         self::assertStringContainsString('type=A', $this->transport->lastRequest()->url);
     }
 
+    public function testListRecordSetsUnderReadsTheWholeSubtreeAndStopsAfterIt(): void
+    {
+        $this->transport->queue(
+            new Response(200, [], $this->listResponse([
+                $this->multiValueXml('pool.example.com.', 'TXT', 'x', '"note"'),
+                $this->multiValueXml('frankfurt.pool.example.com.', 'A', 'n1', '1.1.1.1'),
+            ], true, 'tokyo.pool.example.com.', 'A', 'n2')),
+            new Response(200, [], $this->listResponse([
+                $this->multiValueXml('tokyo.pool.example.com.', 'A', 'n2', '2.2.2.2'),
+                $this->multiValueXml('\\052.pool.example.com.', 'A', 'n3', '3.3.3.3'),
+                // 子树之外（poolx 排在 pool. 之后）：到此为止
+                $this->multiValueXml('poolx.example.com.', 'A', 'n4', '4.4.4.4'),
+            ], true, 'www.example.com.', 'A'))
+        );
+
+        $records = $this->client->listRecordSetsUnder('Z123', 'Pool.Example.com.');
+
+        self::assertSame(['pool.example.com', 'frankfurt.pool.example.com', 'tokyo.pool.example.com', '*.pool.example.com'], array_map(static function (RecordSet $r) {
+            return $r->name;
+        }, $records));
+        self::assertCount(2, $this->transport->requests);
+        self::assertStringContainsString('name=pool.example.com.', $this->transport->requests[0]->url);
+        self::assertStringContainsString('identifier=n2', $this->transport->lastRequest()->url);
+    }
+
+    public function testListRecordSetsUnderGivesUpOnHugeSubtrees(): void
+    {
+        $page = new Response(200, [], $this->listResponse([
+            $this->multiValueXml('a.pool.example.com.', 'A', 'n1', '1.1.1.1'),
+        ], true, 'b.pool.example.com.', 'A', 'n2'));
+        $this->transport->queue($page, $page);
+
+        self::assertNull($this->client->listRecordSetsUnder('Z123', 'pool.example.com', 2));
+        self::assertCount(2, $this->transport->requests);
+    }
+
+    public function testIsWithin(): void
+    {
+        self::assertTrue(Route53Client::isWithin('pool.example.com', 'pool.example.com'));
+        self::assertTrue(Route53Client::isWithin('tokyo.pool.example.com', 'pool.example.com'));
+        self::assertFalse(Route53Client::isWithin('xpool.example.com', 'pool.example.com'));
+        self::assertFalse(Route53Client::isWithin('example.com', 'pool.example.com'));
+    }
+
     public function testListsWildcardNamesUsingEscapes(): void
     {
         $this->transport->queue(new Response(200, [], $this->listResponse([

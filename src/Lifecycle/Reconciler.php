@@ -9,6 +9,7 @@ use Wcore\Dnslb\Dns\ForeignRecordTracker;
 use Wcore\Dnslb\Metrics\MetricException;
 use Wcore\Dnslb\Metrics\MetricRegistry;
 use Wcore\Dnslb\Notify\EventRecorder;
+use Wcore\Dnslb\Provider\ConsoleOutputProvider;
 use Wcore\Dnslb\Provider\Instance;
 use Wcore\Dnslb\Provider\ProviderRegistry;
 use Wcore\Dnslb\State\Node;
@@ -51,6 +52,7 @@ final class Reconciler
     private Clock $clock;
     private Logger $logger;
     private ?MetricRegistry $metrics;
+    private ?ConsoleArchive $consoleArchive;
 
     /** @var Node[] 本轮丢失的在线节点 */
     private array $lost = [];
@@ -77,7 +79,8 @@ final class Reconciler
         EventRecorder $events,
         Clock $clock,
         Logger $logger,
-        ?MetricRegistry $metrics = null
+        ?MetricRegistry $metrics = null,
+        ?ConsoleArchive $consoleArchive = null
     ) {
         $this->config = $config;
         $this->providers = $providers;
@@ -90,6 +93,7 @@ final class Reconciler
         $this->clock = $clock;
         $this->logger = $logger;
         $this->metrics = $metrics;
+        $this->consoleArchive = $consoleArchive;
     }
 
     /**
@@ -323,23 +327,71 @@ final class Reconciler
             return;
         }
 
-        $healthy = $node->v4->healthy && (!$this->config->dns->ipv6 || $node->v6->healthy);
-        if ($healthy) {
-            $node->transition(Node::IN_SERVICE, $now);
-            $this->nodes->save($node, $now);
-            $state = $this->pools->get($node->pool);
-            if ($state->warmupFailures > 0) {
-                $state->warmupFailures = 0;
-                $this->pools->save($state);
-            }
-            $age = $now - $node->createdAt;
-            $this->events->info('node_in_service', $this->inServiceMessage($age), $node->pool, $node->nodeId);
+        if ($this->passesHealthChecks($node)) {
+            $this->promote($node, $now);
             return;
         }
         if ($now - $node->createdAt > $this->config->warmupTimeout) {
             $error = $node->v4->error ?? $node->v6->error ?? ($node->probedAt === null ? '健康检查尚未执行（Dnslb::health() 是否在定时运行？）' : '健康检查未通过');
             $this->warmupFailed($node, "健康检查一直未通过：{$error}");
         }
+    }
+
+    /**
+     * 是否有已通过健康检查、等待转为在线的预热节点（只读，不需要 tick 锁）。
+     */
+    public function hasPromotableWarming(): bool
+    {
+        foreach ($this->nodes->byStates([Node::WARMING]) as $node) {
+            if ($this->passesHealthChecks($node)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 把已通过健康检查的预热节点转为在线，供 health 进程在健康检查通过后立即调用，不必等下一个 tick。
+     *
+     * 调用方必须持有 tick 锁：节点状态只在 tick 锁内修改（tick 和手动操作也一样），不会与 tick 互相覆盖。
+     * 这里只看健康结果、不查云厂商（健康检查通过说明实例在运行）；实例消失、预热超时仍由 tick 处理。
+     *
+     * @return string[] 转为在线的节点 ID
+     */
+    public function promoteHealthyWarming(): array
+    {
+        $now = $this->clock->now();
+        $promoted = [];
+        foreach ($this->nodes->byStates([Node::WARMING]) as $node) {
+            if ($this->passesHealthChecks($node)) {
+                $this->promote($node, $now);
+                $promoted[] = $node->nodeId;
+            }
+        }
+        return $promoted;
+    }
+
+    /**
+     * 所有需要的协议族都已通过健康检查（连续 rise 次）。
+     */
+    private function passesHealthChecks(Node $node): bool
+    {
+        return $node->v4->healthy && (!$this->config->dns->ipv6 || $node->v6->healthy);
+    }
+
+    /**
+     * 预热节点转为在线（之后由 DnsSync 发布）。
+     */
+    private function promote(Node $node, int $now): void
+    {
+        $node->transition(Node::IN_SERVICE, $now);
+        $this->nodes->save($node, $now);
+        $state = $this->pools->get($node->pool);
+        if ($state->warmupFailures > 0) {
+            $state->warmupFailures = 0;
+            $this->pools->save($state);
+        }
+        $this->events->info('node_in_service', $this->inServiceMessage($now - $node->createdAt), $node->pool, $node->nodeId);
     }
 
     /**
@@ -578,8 +630,42 @@ final class Reconciler
 
     private function warmupFailed(Node $node, string $reason): void
     {
-        $this->fail($node, 'warmup_timeout', "超过 {$this->config->warmupTimeout} 秒仍未上线：{$reason}");
+        $this->fail($node, 'warmup_timeout', "超过 {$this->config->warmupTimeout} 秒仍未上线：{$reason}" . $this->saveConsoleOutput($node));
         $this->recordStartupFailure($node->pool);
+    }
+
+    /**
+     * 删除预热失败的实例之前保存它的串口输出（云厂商支持时，目前只有 EC2），用来排查开机脚本卡在哪里。
+     * 失败不影响后续处理。
+     *
+     * @return string 追加到事件消息的说明
+     */
+    private function saveConsoleOutput(Node $node): string
+    {
+        if ($this->consoleArchive === null || !$this->consoleArchive->enabled() || $node->instanceId === null) {
+            return '';
+        }
+        $provider = $this->providers->get($node->provider);
+        if (!$provider instanceof ConsoleOutputProvider) {
+            return '';
+        }
+        try {
+            $output = $provider->consoleOutput($node->providerRegion, $node->instanceId);
+        } catch (\Throwable $e) {
+            $this->logger->warning("Cannot fetch console output of {$node->nodeId}: {$e->getMessage()}");
+            return "；未能获取串口输出：{$e->getMessage()}";
+        }
+        if ($output === null || trim($output) === '') {
+            return '；串口输出为空';
+        }
+        try {
+            $file = $this->consoleArchive->save($node->nodeId, $node->instanceId, $output, $this->clock->now());
+        } catch (\Throwable $e) {
+            $this->logger->warning("Cannot save console output of {$node->nodeId}: {$e->getMessage()}");
+            return "；串口输出保存失败：{$e->getMessage()}";
+        }
+        $this->logger->info("Saved console output of {$node->nodeId} to {$file}");
+        return "；串口输出已保存到 {$file}";
     }
 
     /**

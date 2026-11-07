@@ -24,7 +24,10 @@ final class TestApp
     /**
      * @param bool $cloudflare 使用 Cloudflare DNS（池不带 latency_region）
      */
-    public function __construct(array $overrides = [], bool $cloudflare = false)
+    /**
+     * @param string|null $consoleDir 预热失败时保存串口输出的目录（默认不保存）
+     */
+    public function __construct(array $overrides = [], bool $cloudflare = false, ?string $consoleDir = null)
     {
         $this->network = new FakeNetwork();
         $this->transport = (new FakeTransport())->handle($this->network);
@@ -36,6 +39,7 @@ final class TestApp
             'clock' => $this->clock,
             'logger' => $this->logger,
             'database' => Database::open(':memory:'),
+            'console_dir' => $consoleDir,
         ]);
     }
 

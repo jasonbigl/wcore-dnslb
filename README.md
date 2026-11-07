@@ -36,7 +36,7 @@ api.example.com（或 *.example.com）   每个健康节点一条 A / AAAA 记�
 
 | 方法 | 职责 |
 |---|---|
-| `health()` | 每 10 秒并行探测所有节点的健康检查地址，连续失败摘除、连续成功加回，并同步 DNS |
+| `health()` | 每 10 秒并行探测所有节点的健康检查地址，连续失败摘除、连续成功加回；预热节点通过检查后立即上线（tick 正在运行时等下一轮），并同步 DNS |
 | `tick()` | 推进节点生命周期 → 自动修复 → 维持 min / max → 按指标扩缩容 → 同步 DNS → 发送通知 → 心跳 |
 
 节点生命周期：建机（PROVISIONING）→ 启动（BOOTING）→ 预热（WARMING，健康检查通过才上线）→ 在线（IN_SERVICE）→ 排空（DRAINING）→ 删除（TERMINATED）。
@@ -44,7 +44,7 @@ api.example.com（或 *.example.com）   每个健康节点一条 A / AAAA 记�
 ## 环境要求
 
 - PHP 7.4 及以上，扩展：curl、json、pdo_sqlite、simplexml
-- 控制器机器：能访问各节点的健康检查端口；开启 IPv6（`dns.ipv6`）时必须有 IPv6 出口
+- 控制器机器：能访问各节点的健康检查端口；开启 IPv6（`dns.ipv6`）时必须有 IPv6 出口。使用 Route 53 时建议放在 AWS us-east-1：Route 53 接口在那里，每次调用几十毫秒；从其他地方（尤其经过代理）调用可能要 1 秒以上，每次 DNS 同步都会拖慢健康检查轮次，故障发现和新节点上线随之变慢
 - 节点镜像支持 cloud-init（Linode 需选择支持 Metadata 服务的机房和镜像）
 - DNS：AWS Route 53 托管区域，或 Cloudflare 上的区域（域名的 NS 已切换到 Cloudflare）
 - AWS 账号：使用 Route 53、EC2 或 SES 时需要
@@ -64,7 +64,7 @@ composer require wcore/dnslb:dev-main
 ### 1. 准备凭证
 
 - **AWS**：创建一个 IAM 用户，使用 [docs/iam-policy.json](docs/iam-policy.json) 中的最小权限策略（把 `ZONE_ID`、`ACCOUNT_ID`、`SERVICE`、`SES_REGION` 替换成实际值；发布到多个托管区域时，Route 53 那一段的 `Resource` 列出每个区域）。
-  - EC2 只能创建带 `dnslb:service=<服务名>` 标签的实例，也只能删除带这个标签的实例。
+  - EC2 只能创建带 `dnslb:service=<服务名>` 标签的实例，也只能删除带这个标签的实例、读取它们的串口输出（`ec2:GetConsoleOutput`，预热失败时保存，见 `warmup.timeout`）。
   - 配置了 `iam_instance_profile` 时，还需要对该角色的 `iam:PassRole` 权限。
   - `route53:TestDNSAnswer` 只有 `tools/verify-route53.php` 用到。
 - **Cloudflare**（使用 Cloudflare DNS 时）：创建 API 令牌，只授予用到的区域 `Zone - DNS - Edit` 和 `Zone - Zone - Read`。
@@ -97,7 +97,7 @@ composer require wcore/dnslb:dev-main
   - 各区域依次同步、互不影响：一个区域的接口出错时其他区域照常更新，下一轮重试（`tick` 记一条 `dns_sync_failed`，消息中带出错的区域）。节点要从所有区域都摘除后才开始排空计时，任何一个区域读不到记录时都延后删除机器。
   - 接管、外来记录告警、保留记录（`dns_empty_held`）按区域分别处理，邮件中写明是哪个名称，各区域分别限频。`status()` 的 `dns.zones` 列出各区域，以及是否还在等待接管（`takeover_pending`）。
   - `health_check.host` 默认取第一个区域的 `name`（它是通配符时必须配置）。节点证书要覆盖所有域名。
-  - 每次同步每个区域都要读取 1 + 池数个名称，Route 53 接口每个账号限 5 次/秒（遇到限流会退避重试），区域很多时同步会慢一些。
+  - 每次同步每个区域读取 2 次 Route 53（对外名称，以及池记录所在的整棵子树），不随池数增加。Route 53 接口每个账号限 5 次/秒（遇到限流会退避重试），区域很多时同步会慢一些。
   - 从配置里删除区域之前，要先手动删除它的记录，见「注意事项」。
 - 凭证建议通过 `getenv()` 读取，不要提交到代码仓库。
 
@@ -323,7 +323,7 @@ if ($preview->orphans !== [] && $this->confirm('确认删除这些实例？')) {
 | `health_check.fall` / `rise` | 3 / 2 | 连续失败多少次摘除 / 连续成功多少次加回 |
 | `health_check.global_freeze_ratio` | 0.5 | 同一轮超过该比例的在线节点失败时冻结，不摘除任何节点。只有 1 台在线节点时不判断 |
 | `health_check.pool_failover_after` | 180 | 仅 Route 53：整池故障持续多久后撤下该区域，流量转到其他区域，撤下时记录 `pool_withdrawn` 事件（不发邮件，`status()` 的最近事件中可见）。Cloudflare 下整池故障时直接撤下，由其他池承接 |
-| `warmup.timeout` | 900 | 从建机到上线的最长时间 |
+| `warmup.timeout` | 900 | 从建机到上线的最长时间。超时的 EC2 节点在删除前保存串口输出（cloud-init 日志，最近约 64 KB）到状态库旁边的 `<state>.console/`，只保留最近 50 份（文件权限 0600，可能含开机脚本打印的敏感信息），`warmup_timeout` 事件中带文件路径；Linode 没有对应接口 |
 | `drain.min` / `drain.max` | 300 / 1800 | 排空时间，从确认节点已不在 DNS 中时算起：配置了 `drain.idle` 时，过了 min 且流量低于阈值即可删除；否则等满 max |
 | `autoheal.unhealthy_for` | 300 | 在线节点持续不健康多久后替换 |
 | `autoheal.max_unhealthy_ratio` | 0.5 | 所有在线节点中不健康比例超过此值视为系统性故障，只告警不替换。只有 1 台在线节点时不判断 |

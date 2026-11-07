@@ -10,7 +10,7 @@ use Wcore\Dnslb\Config\LaunchSpec;
  * AWS EC2 实例。用节点 ID 作为 ClientToken，重试不会重复创建；
  * 节点 ID 同时写入 Name 和 dnslb:node 标签。
  */
-final class Ec2Provider implements ProviderInterface
+final class Ec2Provider implements ProviderInterface, ConsoleOutputProvider
 {
     /** 未被删除的实例状态 */
     private const ACTIVE_STATES = ['pending', 'running', 'stopping', 'stopped', 'shutting-down'];
@@ -127,6 +127,33 @@ final class Ec2Provider implements ProviderInterface
             }
         }
         return $result;
+    }
+
+    /**
+     * 最近约 64 KB 的串口输出（Latest，只有 Nitro 实例支持；不支持时退回启动阶段的输出）。
+     * 需要 ec2:GetConsoleOutput 权限。
+     */
+    public function consoleOutput(string $region, string $instanceId): ?string
+    {
+        try {
+            $xml = $this->client->call($region, 'GetConsoleOutput', ['InstanceId' => $instanceId, 'Latest' => 'true']);
+        } catch (AwsException $e) {
+            if (in_array($e->getErrorCode(), self::NOT_FOUND_CODES, true) || stripos($e->getErrorCode(), 'Unauthorized') !== false
+                || $e->getErrorCode() === 'AccessDenied') {
+                throw new ProviderException($e->getMessage(), $e->getErrorCode(), $e);
+            }
+            try {
+                $xml = $this->client->call($region, 'GetConsoleOutput', ['InstanceId' => $instanceId]);
+            } catch (AwsException $retry) {
+                throw new ProviderException($retry->getMessage(), $retry->getErrorCode(), $retry);
+            }
+        }
+        $data = trim((string) $xml->output);
+        if ($data === '') {
+            return null;
+        }
+        $decoded = base64_decode($data, true);
+        return $decoded === false ? null : $decoded;
     }
 
     public function terminate(string $region, string $instanceId): void

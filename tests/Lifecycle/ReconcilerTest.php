@@ -231,6 +231,77 @@ final class ReconcilerTest extends TestCase
         self::assertSame(2, $this->t->app->pools()->get('tokyo')->warmupFailures, 'both boot-stalled nodes timed out');
     }
 
+    public function testWarmupTimeoutSavesConsoleOutputBeforeTerminating(): void
+    {
+        $dir = sys_get_temp_dir() . '/dnslb-console-test-' . bin2hex(random_bytes(4));
+        $this->t = $this->app([], $dir);
+        $this->tick();
+        [$a, $b] = $this->t->app->nodes()->liveInPool('tokyo');
+        $this->aws->consoleOutputs[$a->instanceId] = "\e[0;32m  OK  \e[0m] Started docker\r\n!! edge-mysql unhealthy\n";
+        $this->t->clock->advance(901);
+        // 第二台取不到串口输出（例如缺少 ec2:GetConsoleOutput 权限）：照常删除实例
+        $this->aws->consoleFails = null;
+        $this->tick(false);
+
+        try {
+            $files = glob("{$dir}/*.log");
+            self::assertCount(1, $files);
+            self::assertStringEndsWith("-{$a->nodeId}-{$a->instanceId}.log", $files[0]);
+            self::assertSame("  OK  ] Started docker\n!! edge-mysql unhealthy\n", file_get_contents($files[0]), 'colors and carriage returns are stripped');
+            self::assertSame('0600', substr(sprintf('%o', fileperms($files[0])), -4));
+            self::assertStringContainsString("串口输出已保存到 {$files[0]}", (string) $this->node($a->nodeId)->lastError);
+            self::assertStringContainsString('串口输出为空', (string) $this->node($b->nodeId)->lastError);
+            self::assertSame(Instance::GONE, $this->aws->instanceOf($a->nodeId)->status);
+            self::assertSame(Instance::GONE, $this->aws->instanceOf($b->nodeId)->status);
+            // 取串口输出在删除实例之前
+            $calls = $this->aws->calls;
+            self::assertLessThan(array_search("terminate {$a->instanceId}", $calls, true), array_search("console {$a->instanceId}", $calls, true));
+        } finally {
+            array_map('unlink', glob("{$dir}/*") ?: []);
+            @rmdir($dir);
+        }
+    }
+
+    public function testConsoleOutputFailureDoesNotBlockWarmupFailure(): void
+    {
+        $dir = sys_get_temp_dir() . '/dnslb-console-test-' . bin2hex(random_bytes(4));
+        $this->t = $this->app([], $dir);
+        $this->tick();
+        $ids = array_map(static function (Node $node): string {
+            return $node->nodeId;
+        }, $this->t->app->nodes()->liveInPool('tokyo'));
+        $this->aws->consoleFails = 'not authorized to perform ec2:GetConsoleOutput';
+        $this->t->clock->advance(901);
+        $this->tick(false);
+
+        self::assertCount(2, $ids);
+        foreach ($ids as $id) {
+            $node = $this->node($id);
+            self::assertSame(Node::TERMINATED, $node->state);
+            self::assertStringContainsString('未能获取串口输出：not authorized', (string) $node->lastError);
+        }
+        self::assertSame([], glob("{$dir}/*") ?: []);
+        @rmdir($dir);
+    }
+
+    public function testConsoleArchiveKeepsTheLatestFiles(): void
+    {
+        $dir = sys_get_temp_dir() . '/dnslb-console-test-' . bin2hex(random_bytes(4));
+        $archive = new \Wcore\Dnslb\Lifecycle\ConsoleArchive($dir);
+        try {
+            for ($i = 0; $i < \Wcore\Dnslb\Lifecycle\ConsoleArchive::KEEP + 3; $i++) {
+                $archive->save("web-tokyo-{$i}", "i/{$i}", "out {$i}", 1700000000 + $i);
+            }
+            $files = glob("{$dir}/*.log");
+            self::assertCount(\Wcore\Dnslb\Lifecycle\ConsoleArchive::KEEP, $files);
+            self::assertStringContainsString('web-tokyo-3-i_3.log', $files[0], 'the three oldest were removed; unsafe characters replaced');
+            self::assertFalse((new \Wcore\Dnslb\Lifecycle\ConsoleArchive(null))->enabled());
+        } finally {
+            array_map('unlink', glob("{$dir}/*") ?: []);
+            @rmdir($dir);
+        }
+    }
+
     public function testLostServingNodeIsReplacedByMinFill(): void
     {
         [$a] = $this->serving(2);
@@ -526,7 +597,7 @@ final class ReconcilerTest extends TestCase
         );
     }
 
-    private function app(array $overrides = []): TestApp
+    private function app(array $overrides = [], ?string $consoleDir = null): TestApp
     {
         $t = new TestApp(array_replace_recursive([
             'providers' => ['backup' => ['driver' => 'ec2']],
@@ -541,7 +612,7 @@ final class ReconcilerTest extends TestCase
                 'frankfurt' => ['min' => 0],
             ],
             'autoheal' => ['max_warmup_failures' => 3],
-        ], $overrides));
+        ], $overrides), false, $consoleDir);
         $this->aws = new FakeProvider('aws');
         $this->backup = new FakeProvider('backup');
         $t->app->providers()->set('aws', $this->aws);

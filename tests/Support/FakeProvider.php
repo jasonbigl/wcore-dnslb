@@ -4,6 +4,7 @@ namespace Wcore\Dnslb\Tests\Support;
 
 use Wcore\Dnslb\Config\LaunchSpec;
 use Wcore\Dnslb\Http\HttpException;
+use Wcore\Dnslb\Provider\ConsoleOutputProvider;
 use Wcore\Dnslb\Provider\Instance;
 use Wcore\Dnslb\Provider\OutcomeUnknownException;
 use Wcore\Dnslb\Provider\ProviderException;
@@ -12,7 +13,7 @@ use Wcore\Dnslb\Provider\ProviderInterface;
 /**
  * 内存版云厂商。create 默认成功并返回 pending 实例，可用 failCreate / timeoutCreate 模拟失败。
  */
-final class FakeProvider implements ProviderInterface
+final class FakeProvider implements ProviderInterface, ConsoleOutputProvider
 {
     public string $name;
     /** @var array<string,Instance> */
@@ -30,6 +31,9 @@ final class FakeProvider implements ProviderInterface
     /** true 时 create 实际创建实例，但随后抛出异常（模拟进程在保存结果前退出） */
     public bool $crashAfterCreate = false;
     public bool $listFails = false;
+    /** consoleOutput() 的返回值（实例 ID => 串口输出）；consoleFails 非 null 时抛出 ProviderException */
+    public array $consoleOutputs = [];
+    public ?string $consoleFails = null;
     private int $sequence = 0;
 
     public function __construct(string $name = 'aws')
@@ -92,6 +96,15 @@ final class FakeProvider implements ProviderInterface
         if (isset($this->instances[$instanceId])) {
             $this->instances[$instanceId]->status = Instance::GONE;
         }
+    }
+
+    public function consoleOutput(string $region, string $instanceId): ?string
+    {
+        $this->calls[] = "console {$instanceId}";
+        if ($this->consoleFails !== null) {
+            throw new ProviderException($this->consoleFails, 'UnauthorizedOperation');
+        }
+        return $this->consoleOutputs[$instanceId] ?? null;
     }
 
     /**

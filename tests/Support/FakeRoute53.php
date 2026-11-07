@@ -26,6 +26,8 @@ final class FakeRoute53
     /** @var string[][] 每个成功批次的变更描述 */
     public array $batches = [];
     public int $listCalls = 0;
+    /** 列表接口每页最多返回的条数（测试翻页） */
+    public int $maxPageSize = 300;
     /** true 时所有请求返回 403（模拟凭证失效） */
     public bool $denied = false;
 
@@ -59,7 +61,7 @@ final class FakeRoute53
         parse_str((string) parse_url($request->url, PHP_URL_QUERY), $query);
 
         if ($request->method === 'GET' && preg_match('#/hostedzone/[^/]+/rrset$#', $path)) {
-            return $this->list(RecordSet::normalizeName($query['name'] ?? ''));
+            return $this->list($query);
         }
         if ($request->method === 'POST' && preg_match('#/hostedzone/[^/]+/rrset$#', $path)) {
             return $this->change($request->body);
@@ -71,20 +73,50 @@ final class FakeRoute53
         return new Response(404, [], '<ErrorResponse><Error><Code>NotFound</Code><Message>' . $path . '</Message></Error></ErrorResponse>');
     }
 
-    private function list(string $name): Response
+    /**
+     * 与 Route 53 一样：按"标签反转后的名称、类型、SetIdentifier"排序，从 name（及可选的 type / identifier）开始往后列，
+     * 超过 maxitems（以及 maxPageSize）时翻页。
+     */
+    private function list(array $query): Response
     {
         $this->listCalls++;
-        $records = $this->recordsNamed($name);
+        $start = self::nameKey(RecordSet::normalizeName((string) ($query['name'] ?? '')));
+        if (isset($query['type'])) {
+            $start .= "\0" . $query['type'] . "\0" . ($query['identifier'] ?? '');
+        }
+        $records = array_values(array_filter($this->records, static function (RecordSet $r) use ($start): bool {
+            return strcmp(self::sortKey($r), $start) >= 0;
+        }));
         usort($records, static function (RecordSet $a, RecordSet $b): int {
-            return strcmp($a->type . '|' . $a->setIdentifier, $b->type . '|' . $b->setIdentifier);
+            return strcmp(self::sortKey($a), self::sortKey($b));
         });
+        $max = min((int) ($query['maxitems'] ?? 300), $this->maxPageSize);
+        $page = array_slice($records, 0, $max);
+        $next = $records[$max] ?? null;
         $xml = '';
-        foreach ($records as $record) {
+        foreach ($page as $record) {
             // 与真实 Route 53 一样，返回的名称中 * 写成 \052
             $xml .= str_replace('<Name>*.', '<Name>\\052.', $record->toXml());
         }
+        $tail = $next === null ? '<IsTruncated>false</IsTruncated>' : '<IsTruncated>true</IsTruncated>'
+            . '<NextRecordName>' . RecordSet::escapeName($next->name) . '.</NextRecordName>'
+            . "<NextRecordType>{$next->type}</NextRecordType>"
+            . ($next->setIdentifier !== null ? '<NextRecordIdentifier>' . htmlspecialchars($next->setIdentifier, ENT_XML1) . '</NextRecordIdentifier>' : '');
         return new Response(200, [], '<ListResourceRecordSetsResponse xmlns="' . self::NS . '"><ResourceRecordSets>'
-            . $xml . '</ResourceRecordSets><IsTruncated>false</IsTruncated><MaxItems>300</MaxItems></ListResourceRecordSetsResponse>');
+            . $xml . "</ResourceRecordSets>{$tail}<MaxItems>{$max}</MaxItems></ListResourceRecordSetsResponse>");
+    }
+
+    /**
+     * www.example.com → com.example.www.
+     */
+    private static function nameKey(string $name): string
+    {
+        return implode('.', array_reverse(explode('.', $name))) . '.';
+    }
+
+    private static function sortKey(RecordSet $record): string
+    {
+        return self::nameKey($record->name) . "\0" . $record->type . "\0" . ($record->setIdentifier ?? '');
     }
 
     private function change(string $body): Response

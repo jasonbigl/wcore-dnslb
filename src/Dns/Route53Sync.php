@@ -27,6 +27,8 @@ final class Route53Sync implements DnsSync
 {
     /** 单批变更上限，超过时按依赖顺序分批提交 */
     private const MAX_CHANGES_PER_BATCH = 300;
+    /** 一次列出池记录所在子树时最多翻几页；更大时改为逐个池记录名查询 */
+    private const MAX_POOL_SUBTREE_PAGES = 3;
 
     private Config $config;
     private DnsZone $zone;
@@ -268,9 +270,21 @@ final class Route53Sync implements DnsSync
             }
         }
 
+        // 池记录名都在同一个后缀下（pool_domain 去掉 "{pool}."），一次列出这棵子树（通常 1 页）代替逐个名称查询：
+        // 每个区域每次同步固定 2 次读取，不随池数增加。子树太大时（例如 pool_domain 直接放在区域根下）退回逐个查询
+        $suffix = substr($dns->poolDomain, strlen('{pool}.'));
+        $subtree = $this->route53->listRecordSetsUnder($dns->zoneId, $suffix, self::MAX_POOL_SUBTREE_PAGES);
+        $subtreeByName = [];
+        foreach ($subtree ?? [] as $record) {
+            $subtreeByName[$record->name][] = $record;
+        }
+
         foreach (array_keys($poolNames + $legacyNames) as $name) {
             $isConfigured = isset($poolNames[$name]);
-            foreach ($this->route53->listRecordSetsByName($dns->zoneId, $name) as $record) {
+            $records = $subtree !== null && Route53Client::isWithin($name, $suffix)
+                ? $subtreeByName[$name] ?? []
+                : $this->route53->listRecordSetsByName($dns->zoneId, $name);
+            foreach ($records as $record) {
                 if (!self::isAddressType($record) && $record->type !== 'CNAME') {
                     continue;
                 }

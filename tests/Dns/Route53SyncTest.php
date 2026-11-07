@@ -124,6 +124,67 @@ final class Route53SyncTest extends TestCase
         self::assertNotContains('pool_withdrawn', $t->eventTypes(), 'removing a pool from config is not a failure');
     }
 
+    public function testReadsEachZoneWithTwoListCallsRegardlessOfPoolCount(): void
+    {
+        $pools = [];
+        foreach (['tokyo' => 'ap-northeast-1', 'frankfurt' => 'eu-central-1', 'virginia' => 'us-east-1', 'ohio' => 'us-east-2',
+            'oregon' => 'us-west-2', 'saopaulo' => 'sa-east-1', 'singapore' => 'ap-southeast-1', 'mumbai' => 'ap-south-1'] as $name => $region) {
+            $pools[$name] = ['latency_region' => $region, 'max' => 5, 'launch' => [['provider' => 'aws', 'region' => $region, 'instance_type' => 't3.micro', 'ami' => 'ami-0abc', 'subnet_id' => 'subnet-0abc']]];
+        }
+        $t = new TestApp(['dns' => ['ipv6' => false], 'pools' => $pools]);
+        $route53 = $t->network->route53;
+        $i = 0;
+        foreach (array_keys($pools) as $pool) {
+            $t->addNode("web-{$pool}-a", $pool, Node::IN_SERVICE, '10.0.0.' . (++$i));
+        }
+        // 池记录后缀下的无关记录：读到但不管理
+        $route53->add(RecordSet::multiValue('other.pool.app.example.com', 'A', 'manual', 60, ['10.9.9.9']));
+        $t->app->dnsSync()->sync();
+
+        $route53->listCalls = 0;
+        self::assertFalse($t->app->dnsSync()->sync()->hasChanges());
+        self::assertSame(2, $route53->listCalls, '1 for the public name + 1 for the pool record subtree');
+        self::assertCount(8, $t->app->dnsSync()->publishedNodeIds());
+        self::assertSame(['A manual 10.9.9.9'], $t->records('other.pool.app.example.com'));
+    }
+
+    public function testFallsBackToPerNameQueriesWhenThePoolSubtreeIsHuge(): void
+    {
+        $t = new TestApp(['dns' => ['ipv6' => false]]);
+        $route53 = $t->network->route53;
+        $route53->maxPageSize = 2;
+        for ($i = 0; $i < 8; $i++) {
+            $route53->add(RecordSet::multiValue("a{$i}.pool.app.example.com", 'A', 'manual', 60, ["10.9.9.{$i}"]));
+        }
+        $t->addNode('web-tokyo-a', 'tokyo', Node::IN_SERVICE, '10.0.0.1');
+        $t->app->dnsSync()->sync();
+        $t->addNode('web-tokyo-b', 'tokyo', Node::IN_SERVICE, '10.0.0.2');
+        $node = $t->node('web-tokyo-a');
+        $node->transition(Node::DRAINING, $t->clock->now());
+        $t->app->nodes()->save($node, $t->clock->now());
+
+        $route53->listCalls = 0;
+        $t->app->dnsSync()->sync();
+
+        self::assertSame(['A web-tokyo-b 10.0.0.2'], $t->records(self::POOL), 'records are still found and updated through per-name queries');
+        // latency 名称 1 次 + 子树 3 页后放弃 + 2 个池记录名各 1 次
+        self::assertSame(6, $route53->listCalls);
+    }
+
+    public function testChangingPoolDomainRemovesRecordsUnderTheOldName(): void
+    {
+        $t = new TestApp(['dns' => ['ipv6' => false]]);
+        $t->addNode('web-tokyo-a', 'tokyo', Node::IN_SERVICE, '10.0.0.1');
+        $t->app->dnsSync()->sync();
+
+        $t->reconfigure(['dns' => ['ipv6' => false, 'pool_domain' => '{pool}.lb.example.com']]);
+        $t->app->dnsSync()->sync();
+
+        self::assertSame([], $t->records(self::POOL), 'old pool records are found through the latency alias and deleted');
+        self::assertSame(['A web-tokyo-a 10.0.0.1'], $t->records('tokyo.lb.example.com'));
+        self::assertSame(['A dnslb-tokyo -> tokyo.lb.example.com'], $t->records('app.example.com'));
+    }
+
     public function testForeignRecordsOnPublicNameDeferLatencyLayerUntilTakeover(): void
     {
         $t = new TestApp(['dns' => ['ipv6' => false]]);
@@ -159,8 +220,8 @@ final class Route53SyncTest extends TestCase
         self::assertSame([
             'UPSERT AAAA tokyo.pool.app.example.com [web-tokyo-a] 2001:db8::1',
             'UPSERT A tokyo.pool.app.example.com [web-tokyo-a] 10.0.0.1',
-            'DELETE AAAA app.example.com 2001:db8:ffff::9',
             'DELETE A app.example.com 203.0.113.9',
+            'DELETE AAAA app.example.com 2001:db8:ffff::9',
             'UPSERT AAAA app.example.com [dnslb-tokyo] region=ap-northeast-1 -> ' . self::POOL,
             'UPSERT A app.example.com [dnslb-tokyo] region=ap-northeast-1 -> ' . self::POOL,
         ], self::describe($result->changes));
@@ -172,7 +233,7 @@ final class Route53SyncTest extends TestCase
         ], $t->records('app.example.com'));
         self::assertSame(['dns_takeover'], $t->eventTypes(), 'the preview is not recorded');
         self::assertSame(
-            '接管 app.example.com：删除了 2 条不由 dnslb 管理的记录（AAAA 2001:db8:ffff::9、A 203.0.113.9），解析改由 dnslb 管理',
+            '接管 app.example.com：删除了 2 条不由 dnslb 管理的记录（A 203.0.113.9、AAAA 2001:db8:ffff::9），解析改由 dnslb 管理',
             $t->app->events()->recent(1)[0]->message
         );
         self::assertFalse($t->app->dnsSync()->sync()->takeoverPending);

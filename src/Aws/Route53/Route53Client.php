@@ -70,6 +70,57 @@ final class Route53Client extends AwsClient
     }
 
     /**
+     * 列出某个名称本身及其全部子域名下的记录，自动翻页。
+     *
+     * Route 53 按"标签反转后的名称"排序（www.example.com 排作 com.example.www.），一个名称的整棵子树在结果中是连续的，
+     * 并且从这个名称本身开始，所以从它开始列、遇到子树外的名称即停止。用于一次读出同一后缀下的所有池记录。
+     *
+     * @param int $maxPages 最多翻几页（每页 300 条）；子树更大时返回 null，调用方改为逐个名称查询
+     * @return RecordSet[]|null
+     */
+    public function listRecordSetsUnder(string $zoneId, string $name, int $maxPages = 3): ?array
+    {
+        $zoneId = self::stripPrefix($zoneId);
+        $name = RecordSet::normalizeName($name);
+        $query = ['name' => RecordSet::escapeName($name) . '.', 'maxitems' => (string) self::MAX_ITEMS];
+        $records = [];
+
+        for ($page = 1; ; $page++) {
+            $path = '/hostedzone/' . rawurlencode($zoneId) . '/rrset?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
+            $xml = self::requireXml($this->request('GET', $path));
+            foreach ($xml->ResourceRecordSets->ResourceRecordSet as $item) {
+                $record = RecordSet::fromXml($item);
+                if (!self::isWithin($record->name, $name)) {
+                    return $records;
+                }
+                $records[] = $record;
+            }
+            if ((string) $xml->IsTruncated !== 'true' || !self::isWithin(RecordSet::normalizeName((string) $xml->NextRecordName), $name)) {
+                return $records;
+            }
+            if ($page >= $maxPages) {
+                return null;
+            }
+            $query = [
+                'name' => (string) $xml->NextRecordName,
+                'type' => (string) $xml->NextRecordType,
+                'maxitems' => (string) self::MAX_ITEMS,
+            ];
+            if (isset($xml->NextRecordIdentifier)) {
+                $query['identifier'] = (string) $xml->NextRecordIdentifier;
+            }
+        }
+    }
+
+    /**
+     * $name 是 $parent 本身或它的子域名。
+     */
+    public static function isWithin(string $name, string $parent): bool
+    {
+        return $name === $parent || substr($name, -strlen($parent) - 1) === '.' . $parent;
+    }
+
+    /**
      * 原子地提交一批变更：要么全部成功，要么全部不生效。
      *
      * @param Change[] $changes

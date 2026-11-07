@@ -160,4 +160,39 @@ final class Ec2ProviderTest extends TestCase
         }
         return $fields;
     }
+
+    public function testConsoleOutput(): void
+    {
+        $this->transport->queue(new Response(200, [], '<GetConsoleOutputResponse xmlns="' . self::NS . '"><instanceId>i-1</instanceId>'
+            . '<output>' . base64_encode("cloud-init ok\n") . '</output></GetConsoleOutputResponse>'));
+
+        self::assertSame("cloud-init ok\n", $this->provider->consoleOutput('ap-northeast-1', 'i-1'));
+        parse_str($this->transport->lastRequest()->body, $params);
+        self::assertSame(['Action' => 'GetConsoleOutput', 'Version' => '2016-11-15', 'InstanceId' => 'i-1', 'Latest' => 'true'], array_intersect_key($params, array_flip(['Action', 'Version', 'InstanceId', 'Latest'])));
+    }
+
+    public function testConsoleOutputFallsBackWithoutLatestAndReportsEmpty(): void
+    {
+        $this->transport->queue(
+            new Response(400, [], '<Response><Errors><Error><Code>UnsupportedOperation</Code><Message>Latest is only supported on Nitro</Message></Error></Errors></Response>'),
+            new Response(200, [], '<GetConsoleOutputResponse xmlns="' . self::NS . '"><instanceId>i-1</instanceId></GetConsoleOutputResponse>')
+        );
+
+        self::assertNull($this->provider->consoleOutput('ap-northeast-1', 'i-1'));
+        parse_str($this->transport->lastRequest()->body, $params);
+        self::assertArrayNotHasKey('Latest', $params);
+    }
+
+    public function testConsoleOutputAccessDeniedIsNotRetried(): void
+    {
+        $this->transport->queue(new Response(403, [], '<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>not authorized</Message></Error></Errors></Response>'));
+
+        try {
+            $this->provider->consoleOutput('ap-northeast-1', 'i-1');
+            self::fail('Expected ProviderException');
+        } catch (ProviderException $e) {
+            self::assertSame('UnauthorizedOperation', $e->getErrorCode());
+        }
+        self::assertCount(1, $this->transport->requests);
+    }
 }

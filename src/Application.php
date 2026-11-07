@@ -22,12 +22,14 @@ use Wcore\Dnslb\Heartbeat\Heartbeat;
 use Wcore\Dnslb\Http\CurlTransport;
 use Wcore\Dnslb\Http\Transport;
 use Wcore\Dnslb\Lifecycle\AutoHealer;
+use Wcore\Dnslb\Lifecycle\ConsoleArchive;
 use Wcore\Dnslb\Lifecycle\OrphanTracker;
 use Wcore\Dnslb\Lifecycle\Provisioner;
 use Wcore\Dnslb\Lifecycle\Reconciler;
 use Wcore\Dnslb\Lifecycle\Rollout;
 use Wcore\Dnslb\Lifecycle\TickRunner;
 use Wcore\Dnslb\Lifecycle\UserDataRenderer;
+use Wcore\Dnslb\Lifecycle\WarmingPromoter;
 use Wcore\Dnslb\Metrics\MetricRegistry;
 use Wcore\Dnslb\Notify\EventRecorder;
 use Wcore\Dnslb\Notify\Notifier;
@@ -61,7 +63,7 @@ final class Application
     private array $instances = [];
 
     /**
-     * @param array $overrides 替换默认组件（测试用），可用键：transport、clock、logger、database
+     * @param array $overrides 替换默认组件（测试用），可用键：transport、clock、logger、database、console_dir
      */
     public function __construct(Config $config, string $command = '', bool $dryRun = false, array $overrides = [])
     {
@@ -240,7 +242,8 @@ final class Application
             $this->clock(),
             $this->logger(),
             $this->config->healthCheck->interval,
-            $this->heartbeat()
+            $this->heartbeat(),
+            new WarmingPromoter($this->reconciler(), $this->lock('tick'), $this->logger())
         );
     }
 
@@ -285,8 +288,22 @@ final class Application
             $this->eventRecorder(),
             $this->clock(),
             $this->logger(),
-            $this->metrics()
+            $this->metrics(),
+            $this->consoleArchive()
         );
+    }
+
+    /**
+     * 预热失败节点的串口输出存放处：状态库旁边的 {state}.console/；状态库在内存中时不保存。
+     */
+    public function consoleArchive(): ConsoleArchive
+    {
+        if (!isset($this->instances[ConsoleArchive::class])) {
+            $dir = $this->instances['console_dir']
+                ?? ($this->config->statePath === ':memory:' ? null : $this->config->statePath . '.console');
+            $this->instances[ConsoleArchive::class] = new ConsoleArchive($dir);
+        }
+        return $this->instances[ConsoleArchive::class];
     }
 
     public function metrics(): MetricRegistry

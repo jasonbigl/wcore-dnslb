@@ -47,6 +47,7 @@ tokyo.pool.app.example.com   多值回答记录（默认）或加权记录，每
   - `health_check.host` 必须显式配置为通配符覆盖的具体域名（例如 `health.example.com`），用于 SNI 和 Host 头。
   - Route 53 返回的名称中 `*` 写作 `\052`，读写时统一转换。
 - 控制器只修改自己管理的记录：latency 层 SetIdentifier 以 `dnslb-` 开头的记录，以及 `pool_domain` 下的记录。
+- 读取：每次同步读 2 次，不随池数增加。一次读对外名称；另一次读池记录所在的子树（`pool_domain` 去掉 `{pool}.` 的部分）。Route 53 按"标签反转后的名称"排序（`tokyo.pool.app.example.com` 排作 `com.example.app.pool.tokyo.`），整棵子树在结果中连续，并且从子树根开始，所以从根开始列、遇到子树外的名称即停（2026-11-07 在真实 Route 53 上用 `*`、`-`、数字、多级子域名和相似的子树外名称验证过）。子树超过 3 页（例如 `pool_domain` 直接放在区域根下）时改为逐个池记录名查询。`pool_domain` 改过之后的旧记录名不在新子树里，通过 latency 记录的 Alias 目标找回后单独查询。
 - 已在真实 Route 53 上验证（2026-10-20，`tools/verify-route53.php`，通配符测试域名）：latency Alias 可以指向多值回答记录；日本 / 德国用户分别解析到东京 / 法兰克福；摘除节点、整池切换、多值 ↔ 加权切换的批次顺序均被 Route 53 接受；通配符记录读回后与期望一致。
 
 ## 3.1 Cloudflare 记录结构
@@ -71,7 +72,7 @@ api.example.com   A / AAAA，每个健康节点一条（所有池），proxied �
 `dns.zones` 列出多个区域（托管区域 ID + 对外名称，Route 53 还有 `pool_domain`），同一批节点发布到所有区域。只有一个区域时可以直接写 `zone_id` / `name`，两种写法等价。
 
 - 所有区域用同一个 `dns.provider` 和同一份凭证；`ttl`、`ipv6`、`pool_routing`、`proxied` 全局生效。不支持 Route 53 与 Cloudflare 混用（两者整池故障时的节点选择规则不同）。
-- 每个区域一个 `Route53Sync` / `CloudflareSync`，由 `MultiZoneSync` 按配置顺序依次调用，每个区域单独加 DNS 锁、单独读取和提交。Route 53 的 Alias 只能指向同一托管区域内的记录，所以每个区域都有自己的 latency 记录和池记录；Route 53 的变更批次也只能在一个托管区域内原子提交，区域之间不要求同时生效。
+- 每个区域一个 `Route53Sync` / `CloudflareSync`，由 `MultiZoneSync` 按配置顺序依次调用，每个区域单独加 DNS 锁、单独读取和提交。每个区域在开始同步时各自计算期望记录，状态在两次之间变化时，区域之间可能短暂不一致（最多一个同步周期），下一轮收敛。Route 53 的 Alias 只能指向同一托管区域内的记录，所以每个区域都有自己的 latency 记录和池记录；Route 53 的变更批次也只能在一个托管区域内原子提交，区域之间不要求同时生效。
 - 期望发布的节点由同一个 `NodeSelector` 计算，各区域内容相同。
 - 一个区域失败时其他区域照常同步，全部处理完后抛出异常（消息列出失败的区域），调用方下一轮重试：health 进程的指纹不更新，下一轮重新同步所有区域（已同步的区域没有变更）。
 - `publishedNodeIds()` 是所有区域的并集：节点要从每个区域都摘除后才算"不在 DNS 中"，才开始排空计时；任何一个区域读不到记录时抛出异常，排空和孤儿清理都按"读不到 DNS"处理（延后删除）。
@@ -97,6 +98,7 @@ PROVISIONING → BOOTING → WARMING → IN_SERVICE → DRAINING → TERMINATING
 - 缩容选择：优先缩不健康的节点，其次备选 launch 建出的节点，再其次最新创建的节点；剩下的健康节点不少于 min（有节点故障或正在替换时不排空健康节点）。
 - 排空：先确认该节点已不在 DNS 中（DNS 同步失败时一直等待），从确认时起至少等待 `drain.min`；排空期间每个 tick 都复核，记录被外部加回时重新计时（`drain_restarted` 告警），读不到 DNS 时只延后删除；配置了 `drain.idle` 时流量低于阈值即可删除（第四阶段实现）；未配置时等满 `drain.max`。实例已停止时收不到流量，空闲指标说明不了客户端缓存是否过期，确认摘除后等满 `drain.max` 才删除。
 - 建机失败（所有方式都被拒绝）与预热超时一样计入池的连续失败次数，达到 `max_warmup_failures` 后暂停该池建机，避免反复建机。
+- 预热超时的节点删除实例之前先保存串口输出（云厂商实现 `ConsoleOutputProvider` 时，目前只有 EC2：`GetConsoleOutput`，Nitro 实例取最新输出），写到状态库旁边的 `<state>.console/`（目录 0700、文件 0600，保留最近 50 份），事件消息带文件路径。取不到或写不了只记录原因，不影响删除；演练模式不保存。串口输出可能含开机脚本打印的敏感信息，所以不放进邮件。
 - 池节点数超过 max 时，先取消尚未上线的节点（替补和被替换的节点算一台，一起移除），再按缩容顺序排空在线节点；从配置删除的池，在线节点全部排空。
 - 云厂商查询失败时不把任何节点视为丢失；新实例 10 分钟内查不到不算丢失（EC2 最终一致性）。
 - 删除还没有实例 ID 的节点时按节点 ID 查找；查不到时保持 TERMINATING、每个 tick 再查，进入 TERMINATING 满 10 分钟仍查不到才结束（建机结果未知时实例可能刚建出、暂时查不到）。
@@ -108,6 +110,8 @@ PROVISIONING → BOOTING → WARMING → IN_SERVICE → DRAINING → TERMINATING
 ## 5. 健康检查
 
 - `health()` 每分钟调度一次，进程内每 `interval` 秒一轮，约 55 秒后返回。
+- 与 tick 的分工：节点生命周期状态只在 tick 锁内修改（tick 和手动操作都持 tick 锁），云厂商和指标接口只有 tick 调用；health 只做 HTTP 探测，只写健康字段（`NodeRepository::save()` 不写健康列，`saveHealth()` 只写健康列），所以两个进程同时处理同一个节点也不会互相覆盖。DNS 由两边按需同步（在 dns 锁内重新读库计算，谁来同步结果都一样）。
+- 预热节点上线不等 tick：health 每轮检查后，有预热节点已通过检查（`rise` 次，开启 IPv6 时两个协议族都要通过）就试着拿 tick 锁（不等待），拿到后在锁内转为在线，同一轮同步 DNS（`WarmingPromoter`）；tick 正在运行时本轮跳过，下一轮再试，tick 自己也照常转换。这里只看健康结果，不查云厂商；实例消失、预热超时仍由 tick 处理。替补上线后排空旧节点等后续动作由下一个 tick 按状态完成。演练模式不转换。
 - `curl_multi` 并行探测，并发数可配；HTTPS 用 `CURLOPT_RESOLVE` 把域名固定到节点 IP，SNI / Host 正确，可校验证书。
 - 判定：状态码范围、可选响应内容、超时；连续 `fall` 次失败摘除，连续 `rise` 次成功加回。
 - 保护措施：
