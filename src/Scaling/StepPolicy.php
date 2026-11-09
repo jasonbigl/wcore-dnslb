@@ -7,8 +7,8 @@ namespace Wcore\Dnslb\Scaling;
  * - 任一指标高于 scale_out_above 持续 sustain 秒 → 扩容 step 台；
  * - 所有指标低于 scale_in_below 持续 sustain 秒 → 缩容 1 台（不受 step 影响）。
  *
- * 防抖：扩容冷却 cooldown_out；缩容冷却 cooldown_in（距上次任何扩缩容）；有节点启动中时不再动作；
- * 缩容前预测剩余节点的负载，若会超过扩容阈值则不缩。
+ * 防抖：扩容冷却 cooldown_out；缩容冷却 cooldown_in（距上次任何扩缩容）；有节点启动中或新增节点还在稳定期时不再动作，
+ * 但持续时间继续累计，稳定期结束后第一个读数仍超阈值就动作；缩容前预测剩余节点的负载，若会超过扩容阈值则不缩。
  * 指标不可用时不做任何决策，并重新计算持续时间。
  */
 final class StepPolicy implements ScalingPolicyInterface
@@ -54,6 +54,9 @@ final class StepPolicy implements ScalingPolicyInterface
             if ($s->pending > 0) {
                 return new Decision(0, "{$reason}, waiting for {$s->pending} starting node(s)", $since);
             }
+            if ($s->settling > 0) {
+                return new Decision(0, "{$reason}, waiting for {$s->settling} new node(s) to settle", $since);
+            }
             if ($active >= $max) {
                 return new Decision(0, "{$reason}, already at max ({$max})", $since, null, true);
             }
@@ -73,6 +76,9 @@ final class StepPolicy implements ScalingPolicyInterface
             }
             if ($s->pending > 0) {
                 return new Decision(0, "{$reason}, waiting for {$s->pending} starting node(s)", null, $since);
+            }
+            if ($s->settling > 0) {
+                return new Decision(0, "{$reason}, waiting for {$s->settling} new node(s) to settle", null, $since);
             }
             if ($s->serving <= $s->pool->min) {
                 return new Decision(0, "{$reason}, already at min ({$s->pool->min})", null, $since);

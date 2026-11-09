@@ -49,6 +49,8 @@ final class Node
     public bool $outdated = false;
     /** 排空中的节点确认已从 DNS 摘除的时间，排空时长从此时算起 */
     public ?int $dnsRemovedAt = null;
+    /** 预热结束转为在线的时间，只写入一次（替换取消后恢复在线不会改变）；升级前已在线或 rebuildState 恢复的节点为 null */
+    public ?int $inServiceAt = null;
     public ?string $lastError = null;
     public int $createdAt;
     public int $updatedAt;
@@ -112,6 +114,14 @@ final class Node
         return $now - $this->stateChangedAt;
     }
 
+    /**
+     * 上线后是否还在稳定期（scaling.settle）：指标窗口里还留着开机时的数据，DNS 切流也没有完成。
+     */
+    public function isSettling(int $now, int $settle): bool
+    {
+        return $this->inServiceAt !== null && $now - $this->inServiceAt < $settle;
+    }
+
     public static function fromRow(array $row): self
     {
         $node = new self(
@@ -140,6 +150,7 @@ final class Node
         $node->replaceManual = (bool) $row['replace_manual'];
         $node->outdated = (bool) $row['outdated'];
         $node->dnsRemovedAt = self::intOrNull($row['dns_removed_at']);
+        $node->inServiceAt = self::intOrNull($row['in_service_at']);
         $node->launchStartedAt = self::intOrNull($row['launch_started_at']);
         $node->lastError = $row['last_error'];
         $node->updatedAt = (int) $row['updated_at'];
@@ -175,6 +186,7 @@ final class Node
             'replace_manual' => $this->replaceManual ? 1 : 0,
             'outdated' => $this->outdated ? 1 : 0,
             'dns_removed_at' => $this->dnsRemovedAt,
+            'in_service_at' => $this->inServiceAt,
             'launch_started_at' => $this->launchStartedAt,
             'last_error' => $this->lastError,
             'created_at' => $this->createdAt,

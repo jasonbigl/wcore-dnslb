@@ -269,6 +269,19 @@ final class ConfigTest extends TestCase
         self::assertSame(['cpu'], array_keys($scaling->metrics));
     }
 
+    public function testScalingSettleDefaultsToFiveMinutesAndCanBeTurnedOffPerPool(): void
+    {
+        self::assertSame(300, Config::fromArray($this->minimal(), $this->templateDir())->pools['tokyo']->scaling->settle);
+
+        $data = $this->minimal();
+        $data['pools']['tokyo']['scaling'] = ['settle' => 0];
+        self::assertSame(0, Config::fromArray($data, $this->templateDir())->pools['tokyo']->scaling->settle);
+
+        $data['pools']['tokyo']['scaling'] = ['settle' => -1];
+        $this->expectException(ConfigException::class);
+        Config::fromArray($data, $this->templateDir());
+    }
+
     public function testLinodeLaunchSpecValidation(): void
     {
         $data = $this->minimal();

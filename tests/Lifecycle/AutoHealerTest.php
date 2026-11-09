@@ -98,6 +98,7 @@ final class AutoHealerTest extends TestCase
 
         self::assertSame(Node::IN_SERVICE, $this->t->node('web-tokyo-0')->state);
         self::assertNull($this->t->node('web-tokyo-0')->replacedBy);
+        self::assertNull($this->t->node('web-tokyo-0')->inServiceAt, 'returning to in-service does not start a new settle period');
         self::assertSame(Node::TERMINATED, $this->t->node($replacementId)->state);
         self::assertCount(1, $this->aws->callsMatching('terminate'));
     }

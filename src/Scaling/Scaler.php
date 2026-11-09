@@ -20,6 +20,7 @@ use Wcore\Dnslb\Support\Logger;
 /**
  * 按指标为每个池做扩缩容。指标只统计在线（IN_SERVICE / REPLACING）且还在接流量的节点：
  * 启动中、排空中、已从 DNS 摘除的故障节点不参与，避免数据失真（例如死节点的 CPU 接近 0，会拉低平均值）。
+ * 上线不满 scaling.settle 秒的节点也不参与：指标窗口里还留着开机时的数据。
  */
 final class Scaler
 {
@@ -93,9 +94,15 @@ final class Scaler
         });
 
         $ipv6 = $this->config->dns->ipv6;
-        $reporting = array_values(array_filter($serving, static function (Node $node) use ($ipv6): bool {
-            return $node->receivesTraffic($ipv6);
+        $settle = $pool->scaling->settle;
+        $reporting = array_values(array_filter($serving, static function (Node $node) use ($ipv6, $now, $settle): bool {
+            return $node->receivesTraffic($ipv6) && !$node->isSettling($now, $settle);
         }));
+        // 新增节点稳定期内暂缓扩缩容：此时平均值只剩还没分流的老节点，不等待会多扩一批。
+        // 替补不暂缓：被替换的节点原本就在接流量，滚动发布也不能一直挡住扩容
+        $settling = array_filter($serving, static function (Node $node) use ($now, $settle): bool {
+            return $node->replacementFor === null && $node->isSettling($now, $settle);
+        });
         $values = [];
         foreach ($pool->scaling->metrics as $name => $rule) {
             $values[$name] = $this->aggregate($pool, $rule, $reporting);
@@ -106,7 +113,7 @@ final class Scaler
             $this->logger->debug("Pool {$pool->name} is manually paused, not scaling");
             return;
         }
-        $decision = $this->policy($pool)->decide(new PoolSnapshot($pool, count($serving), count($pending), $values, $state, $now));
+        $decision = $this->policy($pool)->decide(new PoolSnapshot($pool, count($serving), count($pending), $values, $state, $now, count($settling)));
         $state->outBreachSince = $decision->outBreachSince;
         $state->inBreachSince = $decision->inBreachSince;
         $this->logger->debug("Pool {$pool->name}: {$decision->reason}", ['delta' => $decision->delta]);

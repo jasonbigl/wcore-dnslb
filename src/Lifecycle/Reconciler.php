@@ -385,6 +385,7 @@ final class Reconciler
     private function promote(Node $node, int $now): void
     {
         $node->transition(Node::IN_SERVICE, $now);
+        $node->inServiceAt = $now;
         $this->nodes->save($node, $now);
         $state = $this->pools->get($node->pool);
         if ($state->warmupFailures > 0) {

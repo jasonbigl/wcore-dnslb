@@ -174,6 +174,125 @@ final class ScalerTest extends TestCase
         self::assertEmpty($this->t->logger->matching('waiting for'));
     }
 
+    public function testPromotionStartsTheSettlePeriod(): void
+    {
+        $this->t->addNode('web-tokyo-new', 'tokyo', Node::WARMING, '10.0.0.7', '2001:db8::7');
+
+        $this->t->app->reconciler()->promoteHealthyWarming();
+
+        $node = $this->t->node('web-tokyo-new');
+        self::assertSame(Node::IN_SERVICE, $node->state);
+        self::assertSame($this->t->clock->now(), $node->inServiceAt);
+    }
+
+    public function testScaleOutWaitsForNewNodesToSettleThenActsOnTheFirstCleanReading(): void
+    {
+        $this->serving(['a', 'b']);
+        $this->settling('new');
+        $this->prom->results['cpu'] = ['web-tokyo-a' => 90, 'web-tokyo-b' => 90, 'web-tokyo-new' => 5];
+
+        $this->scale();
+        $since = $this->t->app->pools()->get('tokyo')->outBreachSince;
+        self::assertNotNull($since);
+
+        $this->t->clock->advance(299);
+        $this->scale();
+        self::assertSame([], $this->aws->callsMatching('create'), 'settle is 300s, even though sustain has passed');
+        self::assertNotEmpty($this->t->logger->matching('waiting for 1 new node(s) to settle'));
+        self::assertSame($since, $this->t->app->pools()->get('tokyo')->outBreachSince, 'the timer keeps running');
+
+        $this->t->clock->advance(1);
+        $this->prom->results['cpu'] = ['web-tokyo-a' => 90, 'web-tokyo-b' => 90, 'web-tokyo-new' => 90];
+        $this->scale();
+        self::assertCount(1, $this->aws->callsMatching('create'), 'the first settled reading is enough');
+    }
+
+    public function testNoScaleOutWhenTheLoadHasSpreadByTheEndOfSettling(): void
+    {
+        $this->serving(['a', 'b']);
+        $this->settling('new');
+        $this->prom->results['cpu'] = ['web-tokyo-a' => 90, 'web-tokyo-b' => 90, 'web-tokyo-new' => 5];
+        $this->scale();
+
+        $this->t->clock->advance(300);
+        $this->prom->results['cpu'] = ['web-tokyo-a' => 60, 'web-tokyo-b' => 60, 'web-tokyo-new' => 55];
+        $this->scale();
+
+        self::assertSame([], $this->aws->callsMatching('create'));
+        self::assertNull($this->t->app->pools()->get('tokyo')->outBreachSince);
+    }
+
+    public function testScaleInWaitsForNewNodesToSettle(): void
+    {
+        $this->serving(['a', 'b', 'c']);
+        $this->settling('new');
+        $this->prom->results['cpu'] = ['web-tokyo-a' => 10, 'web-tokyo-b' => 10, 'web-tokyo-c' => 10, 'web-tokyo-new' => 10];
+
+        $this->scale();
+        $this->t->clock->advance(120);
+        $this->scale();
+        self::assertNotContains('scale_in', $this->t->eventTypes());
+        self::assertNotEmpty($this->t->logger->matching('waiting for 1 new node(s) to settle'));
+
+        $this->t->clock->advance(180);
+        $this->scale();
+        self::assertContains('scale_in', $this->t->eventTypes());
+    }
+
+    public function testSettlingNodesAreLeftOutOfTheAverage(): void
+    {
+        $this->serving(['a', 'b']);
+        $this->settling('new', 'web-tokyo-gone');
+        $this->prom->results['cpu'] = ['web-tokyo-a' => 40, 'web-tokyo-b' => 40, 'web-tokyo-new' => 99];
+
+        $this->scale();
+
+        self::assertNotEmpty($this->t->logger->matching('within thresholds (cpu=40)'));
+    }
+
+    public function testSettlingReplacementsDoNotHoldBackScaling(): void
+    {
+        $this->serving(['a', 'b']);
+        $this->settling('new', 'web-tokyo-gone');
+        $this->prom->results['cpu'] = ['web-tokyo-a' => 90, 'web-tokyo-b' => 80, 'web-tokyo-new' => 5];
+
+        $this->scale();
+        $this->t->clock->advance(120);
+        $this->scale();
+
+        self::assertCount(1, $this->aws->callsMatching('create'), 'average of a and b is 85 > 70');
+        self::assertEmpty($this->t->logger->matching('to settle'));
+    }
+
+    public function testCoverageCountsOnlySettledNodes(): void
+    {
+        $this->serving(['a']);
+        $this->settling('b', 'web-tokyo-gone-1');
+        $this->settling('c', 'web-tokyo-gone-2');
+        $this->prom->results['cpu'] = ['web-tokyo-a' => 90];
+
+        $this->scale();
+        $this->t->clock->advance(120);
+        $this->scale();
+
+        self::assertCount(1, $this->aws->callsMatching('create'));
+        self::assertEmpty($this->t->logger->matching('covers'));
+    }
+
+    public function testPoolOfOnlySettlingNodesDoesNotDecide(): void
+    {
+        $this->settling('a');
+        $this->prom->results['cpu'] = ['web-tokyo-a' => 99];
+        $state = $this->t->app->pools()->get('tokyo');
+        $state->outBreachSince = $this->t->clock->now() - 600;
+        $this->t->app->pools()->save($state);
+
+        $this->scale();
+
+        self::assertSame([], $this->aws->callsMatching('create'));
+        self::assertNull($this->t->app->pools()->get('tokyo')->outBreachSince);
+    }
+
     public function testInsufficientCoverageOrQueryErrorsPreventDecisions(): void
     {
         $this->serving(['a', 'b', 'c']);
@@ -246,6 +365,14 @@ final class ScalerTest extends TestCase
             $node->createdAt -= 100 - $i;
             $this->t->app->nodes()->save($node, $this->t->clock->now());
         }
+    }
+
+    private function settling(string $suffix, ?string $replacementFor = null): void
+    {
+        $node = $this->t->addNode("web-tokyo-{$suffix}", 'tokyo', Node::IN_SERVICE, '10.0.1.1', '2001:db8:1::1');
+        $node->inServiceAt = $this->t->clock->now();
+        $node->replacementFor = $replacementFor;
+        $this->t->app->nodes()->save($node, $this->t->clock->now());
     }
 
     private function scale(): void

@@ -171,6 +171,26 @@ final class StepPolicyTest extends TestCase
         self::assertStringContainsString('push load above scale-out thresholds', $blocked->reason);
     }
 
+    public function testNewNodesStillSettlingHoldScalingAndKeepTheTimers(): void
+    {
+        $high = new PoolState('tokyo');
+        $high->outBreachSince = self::NOW - 300;
+        $held = $this->policy->decide(new PoolSnapshot($this->pool, 3, 0, ['cpu' => 85.0, 'bw' => 100.0], $high, self::NOW, 2));
+        self::assertSame(0, $held->delta);
+        self::assertSame(self::NOW - 300, $held->outBreachSince);
+        self::assertStringContainsString('waiting for 2 new node(s) to settle', $held->reason);
+
+        $atMax = $this->policy->decide(new PoolSnapshot($this->pool, 5, 0, ['cpu' => 85.0, 'bw' => 100.0], $high, self::NOW, 1));
+        self::assertFalse($atMax->atMax, 'readings are not trusted yet, so no at-max notice');
+
+        $low = new PoolState('tokyo');
+        $low->inBreachSince = self::NOW - 300;
+        $held = $this->policy->decide(new PoolSnapshot($this->pool, 3, 0, ['cpu' => 10.0, 'bw' => 50.0], $low, self::NOW, 1));
+        self::assertSame(0, $held->delta);
+        self::assertSame(self::NOW - 300, $held->inBreachSince);
+        self::assertStringContainsString('waiting for 1 new node(s) to settle', $held->reason);
+    }
+
     public function testUnavailableMetricMeansNoDecisionAndResetsTimers(): void
     {
         $state = new PoolState('tokyo');

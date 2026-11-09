@@ -97,6 +97,10 @@ final class Schema
                     PRIMARY KEY (provider, instance_id)
                 )',
             ],
+            [
+                // 节点上线时间（scaling.settle 使用）；升级前已在线的节点为 NULL，按已过稳定期处理
+                'ALTER TABLE nodes ADD COLUMN in_service_at INTEGER',
+            ],
         ];
     }
 }

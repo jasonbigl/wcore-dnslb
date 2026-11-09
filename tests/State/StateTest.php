@@ -111,6 +111,42 @@ final class StateTest extends TestCase
         }
     }
 
+    public function testNodesOnlineBeforeTheUpgradeCountAsSettled(): void
+    {
+        $path = sys_get_temp_dir() . '/dnslb-upgrade-' . bin2hex(random_bytes(4)) . '.sqlite';
+        try {
+            $pdo = new \PDO('sqlite:' . $path);
+            foreach (Schema::migrations()[0] as $sql) {
+                $pdo->exec($sql);
+            }
+            $pdo->exec('PRAGMA user_version = 1');
+            $pdo->exec("INSERT INTO nodes (node_id, pool, state, provider, provider_region, launch_index, weight, created_at, updated_at, state_changed_at)
+                VALUES ('web-tokyo-old', 'tokyo', 'in_service', 'aws', 'x', 0, 10, 1, 1, 1)");
+            unset($pdo);
+
+            $node = (new NodeRepository(Database::open($path)))->find('web-tokyo-old');
+
+            self::assertNotNull($node);
+            self::assertNull($node->inServiceAt);
+            self::assertFalse($node->isSettling(2, 300));
+        } finally {
+            foreach (glob($path . '*') ?: [] as $file) {
+                unlink($file);
+            }
+        }
+    }
+
+    public function testNodeIsSettlingForTheConfiguredPeriodAfterGoingInService(): void
+    {
+        $node = new Node('web-tokyo-aaaaaa', 'tokyo', 'aws', 'x', 0, 10, 100);
+        $node->inServiceAt = 200;
+
+        self::assertTrue($node->isSettling(200, 300));
+        self::assertTrue($node->isSettling(499, 300));
+        self::assertFalse($node->isSettling(500, 300));
+        self::assertFalse($node->isSettling(200, 0), 'settle 0 turns it off');
+    }
+
     public function testNodeRoundTrip(): void
     {
         $repo = new NodeRepository($this->db);
@@ -128,6 +164,7 @@ final class StateTest extends TestCase
         $node->v6->error = 'connect timeout';
         $node->probedAt = 1150;
         $node->replacementFor = 'web-tokyo-zzzzzz';
+        $node->inServiceAt = 1180;
         $repo->save($node, 1200);
         $repo->saveHealth($node);
 
@@ -143,6 +180,7 @@ final class StateTest extends TestCase
         self::assertSame(3, $loaded->v6->fails);
         self::assertSame('connect timeout', $loaded->v6->error);
         self::assertSame('web-tokyo-zzzzzz', $loaded->replacementFor);
+        self::assertSame(1180, $loaded->inServiceAt);
         self::assertSame(1000, $loaded->createdAt);
         self::assertSame(1100, $loaded->stateChangedAt);
         self::assertSame(1200, $loaded->updatedAt);

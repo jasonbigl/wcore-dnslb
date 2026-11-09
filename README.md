@@ -332,6 +332,7 @@ if ($preview->orphans !== [] && $this->confirm('确认删除这些实例？')) {
 | `scaling.step` | 1 | 每次扩容台数（缩容固定每次 1 台，速度由 `cooldown_in` / `sustain` 决定） |
 | `scaling.sustain` | 300 | 指标持续超过阈值多久才动作 |
 | `scaling.cooldown_out` / `cooldown_in` | 600 / 900 | 扩容冷却 / 缩容冷却（距上次任何扩缩容） |
+| `scaling.settle` | 300 | 节点上线后的稳定期（秒）：期间该节点不计入指标和 `min_coverage`，扩容或补足 `min` 新建的节点还会让该池暂缓扩缩容（发布、自动修复的替补不暂缓）。建议不小于 `rate()` 窗口 + tick 间隔 + DNS TTL；0 表示关闭 |
 | `scaling.min_coverage` | 0.5 | 有指标数据的在线节点比例低于此值时不做决策 |
 | `notify.throttle` | 3600 | 同一告警最小发送间隔。恢复通知不受限制：已发出的告警恢复时一定会收到恢复通知，之后再次故障立即告警 |
 

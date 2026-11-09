@@ -13,6 +13,8 @@ final class ScalingConfig
     public int $sustain;
     public int $cooldownOut;
     public int $cooldownIn;
+    /** 节点上线后的稳定期（秒）：不计入指标，新增节点还会让该池暂缓扩缩容；0 表示关闭 */
+    public int $settle;
     /** 有指标数据的在线节点比例低于此值时不做决策 */
     public float $minCoverage;
     /** @var array<string,MetricRule> */
@@ -20,13 +22,14 @@ final class ScalingConfig
 
     public static function fromSection(Section $s): self
     {
-        $s->allowOnly(['policy', 'step', 'sustain', 'cooldown_out', 'cooldown_in', 'min_coverage', 'metrics']);
+        $s->allowOnly(['policy', 'step', 'sustain', 'cooldown_out', 'cooldown_in', 'settle', 'min_coverage', 'metrics']);
         $c = new self();
         $c->policy = $s->enum('policy', [self::POLICY_STEP], self::POLICY_STEP);
         $c->step = $s->int('step', 1, 1, 100);
         $c->sustain = $s->int('sustain', 300, 0);
         $c->cooldownOut = $s->int('cooldown_out', 600, 0);
         $c->cooldownIn = $s->int('cooldown_in', 900, 0);
+        $c->settle = $s->int('settle', 300, 0);
         $c->minCoverage = $s->float('min_coverage', 0.5, 0.0, 1.0);
         foreach ($s->namedSections('metrics') as $name => $metric) {
             $c->metrics[$name] = MetricRule::fromSection($name, $metric);

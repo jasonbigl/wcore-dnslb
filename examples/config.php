@@ -115,6 +115,7 @@ return [
         'sustain' => 300,                       // 指标持续超过阈值的秒数
         'cooldown_out' => 600,
         'cooldown_in' => 900,
+        'settle' => 300,                        // 节点上线后多少秒内不计入指标，新增节点这段时间内暂缓扩缩容；建议不小于 rate() 窗口 + tick 间隔 + DNS TTL
         'min_coverage' => 0.5,
         // 查询必须按节点返回并带 node_id 标签。任一指标超过 scale_out_above 即扩容，全部低于 scale_in_below 才缩容
         'metrics' => [

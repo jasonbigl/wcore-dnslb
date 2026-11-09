@@ -19,11 +19,13 @@ final class PoolSnapshot
     public array $metrics;
     public PoolState $state;
     public int $now;
+    /** 已计入 serving、但上线后还在稳定期的新增节点数，不含替补 */
+    public int $settling;
 
     /**
      * @param array<string,float|null> $metrics
      */
-    public function __construct(PoolConfig $pool, int $serving, int $pending, array $metrics, PoolState $state, int $now)
+    public function __construct(PoolConfig $pool, int $serving, int $pending, array $metrics, PoolState $state, int $now, int $settling = 0)
     {
         $this->pool = $pool;
         $this->serving = $serving;
@@ -31,5 +33,6 @@ final class PoolSnapshot
         $this->metrics = $metrics;
         $this->state = $state;
         $this->now = $now;
+        $this->settling = $settling;
     }
 }
