@@ -143,6 +143,34 @@ final class StepPolicyTest extends TestCase
         self::assertStringContainsString('push load above scale-out thresholds', $decision->reason);
     }
 
+    public function testScaleInRemovesOneNodeRegardlessOfStep(): void
+    {
+        $pool = $this->poolWithStep(3, 70, 20);
+        $low = new PoolState('tokyo');
+        $low->inBreachSince = self::NOW - 300;
+        $high = new PoolState('tokyo');
+        $high->outBreachSince = self::NOW - 600;
+
+        // 6 台 CPU 19%：一次缩 3 台的预测值 38% 也低于扩容阈值，但缩容每次只缩 1 台
+        self::assertSame(-1, $this->policy->decide(new PoolSnapshot($pool, 6, 0, ['cpu' => 19.0], $low, self::NOW))->delta);
+        self::assertSame(3, $this->policy->decide(new PoolSnapshot($pool, 6, 0, ['cpu' => 90.0], $high, self::NOW))->delta, 'scale-out still uses step');
+    }
+
+    public function testScaleInPredictionAssumesOneNodeRemovedRegardlessOfStep(): void
+    {
+        $pool = $this->poolWithStep(3, 40, 30);
+        $state = new PoolState('tokyo');
+        $state->inBreachSince = self::NOW - 300;
+
+        // 4 台平均 25%，缩 1 台后约 33.3%，低于扩容阈值 40%：可以缩
+        self::assertSame(-1, $this->policy->decide(new PoolSnapshot($pool, 4, 0, ['cpu' => 25.0], $state, self::NOW))->delta);
+
+        // 2 台平均 25%，缩 1 台后 50%，超过扩容阈值 40%：不缩
+        $blocked = $this->policy->decide(new PoolSnapshot($pool, 2, 0, ['cpu' => 25.0], $state, self::NOW));
+        self::assertSame(0, $blocked->delta);
+        self::assertStringContainsString('push load above scale-out thresholds', $blocked->reason);
+    }
+
     public function testUnavailableMetricMeansNoDecisionAndResetsTimers(): void
     {
         $state = new PoolState('tokyo');
@@ -153,6 +181,16 @@ final class StepPolicyTest extends TestCase
         self::assertSame(0, $decision->delta);
         self::assertSame('metric bw unavailable', $decision->reason);
         self::assertNull($decision->outBreachSince);
+    }
+
+    private function poolWithStep(int $step, int $scaleOutAbove, int $scaleInBelow): PoolConfig
+    {
+        $config = TestApp::config([
+            'metric_sources' => ['prom' => ['url' => 'https://prom.test']],
+            'scaling' => ['step' => $step, 'metrics' => ['cpu' => ['source' => 'prom', 'query' => 'cpu', 'scale_out_above' => $scaleOutAbove, 'scale_in_below' => $scaleInBelow]]],
+            'pools' => ['tokyo' => ['min' => 1, 'max' => 10]],
+        ]);
+        return $config->pools['tokyo'];
     }
 
     private function decide(int $serving, int $pending, array $metrics, ?PoolState $state = null): Decision

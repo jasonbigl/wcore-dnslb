@@ -7,6 +7,7 @@ final class ScalingConfig
     public const POLICY_STEP = 'step';
 
     public string $policy;
+    /** 每次扩容的台数；缩容固定 1 台 */
     public int $step;
     /** 指标持续超过阈值多少秒才触发 */
     public int $sustain;

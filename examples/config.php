@@ -111,7 +111,7 @@ return [
 
     'scaling' => [
         'policy' => 'step',
-        'step' => 1,                            // 每次扩 / 缩的台数
+        'step' => 1,                            // 每次扩容的台数；缩容固定每次 1 台
         'sustain' => 300,                       // 指标持续超过阈值的秒数
         'cooldown_out' => 600,
         'cooldown_in' => 900,
