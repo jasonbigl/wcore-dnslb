@@ -133,6 +133,73 @@ final class Ec2Client extends AwsClient
         ];
     }
 
+    /**
+     * 申请一个弹性 IP，同时打上标签。这个接口没有幂等令牌：结果未知时按标签查找（describeAddresses）再决定是否重发。
+     *
+     * @param array<array{Key:string,Value:string}> $tags
+     * @return array{id:string,ip:string}
+     */
+    public function allocateAddress(string $region, array $tags): array
+    {
+        $params = ['Domain' => 'vpc'];
+        if ($tags !== []) {
+            $params['TagSpecification'] = [['ResourceType' => 'elastic-ip', 'Tag' => array_values($tags)]];
+        }
+        $xml = $this->call($region, 'AllocateAddress', $params);
+        return ['id' => (string) $xml->allocationId, 'ip' => (string) $xml->publicIp];
+    }
+
+    /**
+     * @param array $filters           例如 [['Name' => 'tag:dnslb:node', 'Value' => ['web-tokyo-abc123']]]
+     * @param string[] $allocationIds
+     * @return array[] 弹性 IP 列表：[id, ip, association_id, instance_id, tags]，未关联时 association_id / instance_id 为 null
+     */
+    public function describeAddresses(string $region, array $filters = [], array $allocationIds = []): array
+    {
+        $params = [];
+        if ($filters !== []) {
+            $params['Filter'] = $filters;
+        }
+        if ($allocationIds !== []) {
+            $params['AllocationId'] = array_values($allocationIds);
+        }
+        $xml = $this->call($region, 'DescribeAddresses', $params);
+
+        $addresses = [];
+        foreach ($xml->addressesSet->item ?? [] as $item) {
+            $tags = [];
+            foreach ($item->tagSet->item ?? [] as $tag) {
+                $tags[(string) $tag->key] = (string) $tag->value;
+            }
+            $addresses[] = [
+                'id' => (string) $item->allocationId,
+                'ip' => (string) $item->publicIp,
+                'association_id' => self::stringOrNull($item->associationId),
+                'instance_id' => self::stringOrNull($item->instanceId),
+                'tags' => $tags,
+            ];
+        }
+        return $addresses;
+    }
+
+    /**
+     * 把弹性 IP 关联到实例的主网卡（实例必须已经 running）。重复关联到同一实例不会报错。
+     */
+    public function associateAddress(string $region, string $allocationId, string $instanceId): void
+    {
+        $this->call($region, 'AssociateAddress', ['AllocationId' => $allocationId, 'InstanceId' => $instanceId]);
+    }
+
+    public function disassociateAddress(string $region, string $associationId): void
+    {
+        $this->call($region, 'DisassociateAddress', ['AssociationId' => $associationId]);
+    }
+
+    public function releaseAddress(string $region, string $allocationId): void
+    {
+        $this->call($region, 'ReleaseAddress', ['AllocationId' => $allocationId]);
+    }
+
     protected function parseError(Response $response): AwsException
     {
         return self::parseXmlError($response);
@@ -158,6 +225,12 @@ final class Ec2Client extends AwsClient
             }
         }
         return $result;
+    }
+
+    private static function stringOrNull(?\SimpleXMLElement $element): ?string
+    {
+        $value = $element === null ? '' : (string) $element;
+        return $value === '' ? null : $value;
     }
 
     public static function normalizeInstance(\SimpleXMLElement $item): array

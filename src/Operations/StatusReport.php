@@ -29,7 +29,7 @@ final class StatusReport
      *   dns: array{provider: string, zones: array<array{name: string, zone_id: string, takeover_pending: bool}>, routing: string, ipv6: bool},
      *   flags: array<array{flag: string, family: string, since: int}>,
      *   pools: array<array<string,mixed>>,
-     *   orphans: array<array{provider: string, region: string, instance_id: string, node_id: ?string, first_seen_at: int}>,
+     *   orphans: array<array{kind: string, provider: string, region: string, instance_id: string, node_id: ?string, first_seen_at: int}>,
      *   events: array<array<string,mixed>>
      * }
      */
@@ -92,6 +92,8 @@ final class StatusReport
                         'instance_id' => $node->instanceId,
                         'ipv4' => $node->ipv4,
                         'ipv6' => $node->ipv6,
+                        // ipv4 是否为弹性 IP（launch 的 elastic_ip）
+                        'elastic_ip' => $node->elasticIp,
                         'v4_healthy' => $node->v4->healthy,
                         'v6_healthy' => $node->v6->healthy,
                         'health_error' => $node->v4->error ?? $node->v6->error,
@@ -127,7 +129,7 @@ final class StatusReport
             ],
             'flags' => $flags,
             'pools' => $pools,
-            // 已确认的孤儿实例（见 Dnslb::cleanupOrphans()）
+            // 已确认的孤儿实例和弹性 IP（kind 为 address 时 instance_id 是 allocation ID，见 Dnslb::cleanupOrphans()）
             'orphans' => array_map(static function (OrphanInstance $orphan): array {
                 return $orphan->toArray();
             }, $app->orphanTracker()->confirmed()),

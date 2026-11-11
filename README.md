@@ -66,6 +66,7 @@ composer require wcore/dnslb:dev-main
 - **AWS**：创建一个 IAM 用户，使用 [docs/iam-policy.json](docs/iam-policy.json) 中的最小权限策略（把 `ZONE_ID`、`ACCOUNT_ID`、`SERVICE`、`SES_REGION` 替换成实际值；发布到多个托管区域时，Route 53 那一段的 `Resource` 列出每个区域）。
   - EC2 只能创建带 `dnslb:service=<服务名>` 标签的实例，也只能删除带这个标签的实例、读取它们的串口输出（`ec2:GetConsoleOutput`，预热失败时保存，见 `warmup.timeout`）。
   - 配置了 `iam_instance_profile` 时，还需要对该角色的 `iam:PassRole` 权限。
+  - 弹性 IP 相关的几段（`ec2:DescribeAddresses`、`AllocateAddress`、`AssociateAddress`、`DisassociateAddress`、`ReleaseAddress`）只有 launch 开启 `elastic_ip` 时才用到：只能申请带 `dnslb:service=<服务名>` 标签的弹性 IP，也只能关联、释放带这个标签的。没有开启的部署不会调用这些接口，可以不加。
   - `route53:TestDNSAnswer` 只有 `tools/verify-route53.php` 用到。
 - **Cloudflare**（使用 Cloudflare DNS 时）：创建 API 令牌，只授予用到的区域 `Zone - DNS - Edit` 和 `Zone - Zone - Read`。
 - **Linode**：创建 Personal Access Token，权限：Linodes 读写、Images 只读；使用 `firewall_id` 时还需要 Firewalls 读写。
@@ -78,6 +79,7 @@ composer require wcore/dnslb:dev-main
 
 - `service`：服务名，在同一个云账号内必须唯一，不同环境用不同的名字（如 `collector-staging`）。dnslb 按 `dnslb:service=<服务名>` 标签认领云上的实例，两套部署用同一个名字时会互相把对方的机器当成自己的：孤儿清理和 `rebuildState()` 会删除对方的机器。`check()` 会列出带本服务标签、但状态库和本服务 DNS 中都没有的实例。
 - `pools`：`launch` 按顺序列出建机方式，前一种被明确拒绝（容量不足、配额等）自动用下一种；结果未知（超时、限流、5xx）时先在同一方式上确认，2 分钟后仍查不到实例才换下一种，避免在两处各建一台。使用 Route 53 时每个池对应一个 AWS 区域（`latency_region`，Linode 机房映射到地理上最近的 AWS 区域）；使用 Cloudflare 时不需要 `latency_region`，池只用于分区域建机和扩缩容。
+- 弹性 IP（仅 EC2）：在某个 launch 项里写 `'elastic_ip' => true`（默认 `false`），用这种方式建出的每台机器都会申请一个弹性 IP 并关联，DNS 记录用的就是它；不再分配 AWS 自动给的公网 IPv4（IPv6 不受影响）。节点删除时自动释放。详见「注意事项」中的「弹性 IP」。
 - `scaling.metrics`：PromQL 查询必须按节点返回，并带 `node_id` 标签，例如 `... by (node_id)`。
 - `user_data.template`：cloud-init 模板，参考 [examples/cloud-init.yaml](examples/cloud-init.yaml)。内置占位符 `{{node_id}}`、`{{service}}`、`{{pool}}`、`{{provider}}`、`{{region}}`、`{{latency_region}}`，其余在 `user_data.vars` 中定义。节点需要把指标带上 `node_id` 标签上报。
 - 通配符域名：`dns.name` 写成 `'*.example.com'`，并必须配置 `health_check.host` 为一个通配符覆盖的具体域名（用于 SNI 和 Host 头）。
@@ -166,7 +168,7 @@ $lb = Dnslb::fromConfigFile('/etc/dnslb/web.php', ['logger' => $psrLogger]);   /
 | `cancelRollout(?string $pool = null)` | — | 停止发布；已开始的替换继续完成，其余旧节点保持不变 |
 | `pause(?string $pool = null)` / `resume(?string $pool = null)` | — | 暂停 / 恢复自动增删机器（维护时用；健康检查和 DNS 摘除照常）。`resume` 同时解除连续启动失败造成的自动暂停；`$pool` 为 null 时作用于所有池 |
 | `rebuildState(bool $dryRun = false)` | `RebuildResult` | 状态库丢失后，根据云上实例和 DNS 记录重建，并记录 `state_rebuilt` 事件。`restored` 为恢复的节点，`warnings` 为需要确认的情况 |
-| `cleanupOrphans(bool $dryRun = true)` | `OrphanCleanupResult` | 删除孤儿实例：云上带本服务标签、但连续 15 分钟没有节点引用的实例（tick 每 10 分钟检查并告警，`status()` 的 `orphans` 中列出）。**默认只预览**，`orphans` 为将要删除的孤儿；传 false 删除，`terminated` / `failed` 为结果。节点仍在 DNS 中（状态库里却没有这个在线节点）、或读不到 DNS 记录时不删除，列在 `skipped`（实例 ID => 原因）。状态库从备份恢复后先 `rebuildState()`，不要直接删除 |
+| `cleanupOrphans(bool $dryRun = true)` | `OrphanCleanupResult` | 删除孤儿实例：云上带本服务标签、但连续 15 分钟没有节点引用的实例（tick 每 10 分钟检查并告警，`status()` 的 `orphans` 中列出）。**默认只预览**，`orphans` 为将要删除的孤儿；传 false 删除，`terminated` / `failed` 为结果。节点仍在 DNS 中（状态库里却没有这个在线节点）、或读不到 DNS 记录时不删除，列在 `skipped`（实例 ID => 原因）。状态库从备份恢复后先 `rebuildState()`，不要直接删除。没有节点引用的弹性 IP（`orphan_address` 告警）也在这里释放：条目的 `isAddress()` 为 true，`instanceId` 是它的 allocation ID；仍关联着实例的弹性 IP 只有在该实例也于本次删除时才释放，否则列在 `skipped` |
 | `app()` | `Application` | 底层组件（高级用法），例如 `$lb->app()->nodes()->live()` |
 
 - 节点对象（`Wcore\Dnslb\State\Node`）的常用属性：`nodeId`、`pool`、`state`、`provider`、`providerRegion`、`instanceId`、`ipv4`、`ipv6`、`lastError`。
@@ -250,6 +252,29 @@ class DnslbScale extends Command
 ```
 
 ```php
+// 替换单个节点，例如 php artisan dnslb:replace web-dallas-k3m9xa（节点 ID 见 status()）
+// 只能替换在线（in_service）的节点；调用只负责建替补，之后由 tick 完成：替补上线后排空旧节点。
+// 替补没能上线时旧节点恢复为在线，并记录 replace_failed 事件，需要再调用一次
+class DnslbReplace extends Command
+{
+    protected $signature = 'dnslb:replace {node} {--dry-run}';
+
+    public function handle(Dnslb $lb): int
+    {
+        $old = $this->argument('node');
+        try {
+            $new = $lb->replace($old, (bool) $this->option('dry-run'));
+        } catch (\InvalidArgumentException | OperationException $e) {
+            $this->error($e->getMessage());   // 节点不存在 / 不在线 / 替补建机失败
+            return 1;
+        }
+        $this->info("已创建替补 {$new->nodeId}（{$new->provider}/{$new->providerRegion}），上线后自动排空 {$old}");
+        return 0;
+    }
+}
+```
+
+```php
 // 发布新版本，例如在发布流程更新版本号之后执行 php artisan dnslb:rollout
 class DnslbRollout extends Command
 {
@@ -291,15 +316,16 @@ if ($this->confirm('确认切换 DNS？')) {
 ```
 
 ```php
-// 孤儿实例（收到 orphan_instance 告警后）：先预览，确认后再删除
+// 孤儿实例、孤儿弹性 IP（收到 orphan_instance / orphan_address 告警后）：先预览，确认后再删除
 $preview = $lb->cleanupOrphans();
 foreach ($preview->orphans as $orphan) {
-    $this->line("{$orphan->provider}/{$orphan->region} {$orphan->instanceId}（节点 ID {$orphan->nodeId}）");
+    $kind = $orphan->isAddress() ? '弹性 IP' : '实例';
+    $this->line("{$kind} {$orphan->provider}/{$orphan->region} {$orphan->instanceId}（节点 ID {$orphan->nodeId}）");
 }
 foreach ($preview->skipped as $instanceId => $reason) {
     $this->warn("{$instanceId} 不会删除：{$reason}");
 }
-if ($preview->orphans !== [] && $this->confirm('确认删除这些实例？')) {
+if ($preview->orphans !== [] && $this->confirm('确认删除这些实例、释放这些弹性 IP？')) {
     $result = $lb->cleanupOrphans(false);
     foreach ($result->failed as $instanceId => $error) {
         $this->error("{$instanceId} 删除失败：{$error}");
@@ -343,7 +369,15 @@ if ($preview->orphans !== [] && $this->confirm('确认删除这些实例？')) {
 - **DNS 负载均衡生效慢**：新节点只能接到新解析的流量，已缓存 IP 的客户端在 TTL 内（部分运营商 DNS 更久）仍访问旧节点。扩容要留出冷却时间，缩容依靠排空期覆盖缓存。
 - **单探测点**：健康检查只从控制器一个位置发起。金丝雀地址检测探测机自身网络，全局冻结防止探测机线路问题导致大面积误摘；代价是同一轮超过半数节点真实故障时，故障节点会留在 DNS 中，需要人工介入（见下方「后续迭代」）。
 - **单节点服务**：整个服务只有 1 台在线节点时，比例保护没有意义（任何故障都是 100%），因此不冻结、也不判定为系统性故障。节点故障时记录保留（没有其他节点可切），持续 `autoheal.unhealthy_for` 后建替补，替补上线后再排空旧节点。探测机到节点的线路故障也会触发替换：替补通常同样通不过检查，旧节点保留在 DNS 中；连续 `max_warmup_failures` 台失败后该池暂停建机并告警。2 台及以上时照常保护（两台同时故障仍会冻结）。
-- **实例被停止或删除**（控制台关机、宿主机故障等）：在线节点视为丢失，立即从 DNS 摘除并建替补（`node_lost` 告警）。已停止的实例确认摘除后再保留 `drain.max` 才删除，避免公网 IP 释放后被分配给别人时，缓存了旧记录的用户访问到别人的机器（EC2 停机时自动分配的公网 IPv4 已经释放，只有 IPv6 受保护）。需要维护时用 `drain()`，不要直接关机。
+- **实例被停止或删除**（控制台关机、宿主机故障等）：在线节点视为丢失，立即从 DNS 摘除并建替补（`node_lost` 告警）。已停止的实例确认摘除后再保留 `drain.max` 才删除，避免公网 IP 释放后被分配给别人时，缓存了旧记录的用户访问到别人的机器（EC2 停机时自动分配的公网 IPv4 已经释放，只有 IPv6 受保护；使用弹性 IP 的节点停机后地址仍然保留，IPv4 也受保护）。需要维护时用 `drain()`，不要直接关机。
+- **弹性 IP**（launch 的 `elastic_ip`，仅 EC2）：
+  - 顺序是先申请弹性 IP、再建机、实例 running 后关联。申请不到（最常见的是配额用完，`AddressLimitExceeded`）时不会建这台机器，按建机失败处理：换 `launch` 里的下一种方式，都失败则计入连续失败并告警。
+  - **配额**：AWS 默认每个区域只有 5 个弹性 IP。按该区域所有开启了 `elastic_ip` 的池的 `max` 之和，再加上发布、替换时临时多出的台数（替补先上线、旧节点后删除）申请提额。`check()` 会显示该区域已申请的数量。
+  - pending 的实例不能关联弹性 IP，所以建机时会等实例 running（通常 10 ~ 20 秒，每新建一台 tick 就多等这么久）；40 秒还没 running 时先返回，由之后的 tick 关联。关联之前机器没有公网 IPv4，开机脚本的外网请求会等到关联完成。
+  - 节点删除时自动释放它的弹性 IP；暂时释放不了（例如实例还在删除中）时节点保持 `terminating`，每个 tick 重试，超过 10 分钟发 `address_release_failed` 告警（多半是 IAM 权限不足）。
+  - 只对新建的节点生效：打开开关后已在线的节点仍用原来的公网 IP，需要换成弹性 IP 时用 `rollout()` 逐台替换；关闭开关后，已经在用弹性 IP 的节点继续使用，删除时照常释放。
+  - 没人管的弹性 IP（换建机方式、进程中途退出等情况留下的）由孤儿巡检发现并告警（`orphan_address`），用 `cleanupOrphans()` 确认后释放，不会自动释放。
+  - 费用与自动分配的公网 IPv4 相同（按小时计费），没有关联到运行中实例的弹性 IP 同样收费。
 - **IMDSv2**：EC2 实例强制使用 IMDSv2，cloud-init 脚本读取实例元数据时需要先申请令牌。
 - **按指标不会缩容到 0 台**：缩容前会预测剩余节点的负载，剩 0 台时预测不成立。
 - **容量到顶**：已达到 max 而指标仍持续超过扩容阈值时，发出 `scale_at_max` 告警（每个池每小时最多一次），需要人来决定调大 max 还是换用更大的机型。

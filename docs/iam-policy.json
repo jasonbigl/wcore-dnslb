@@ -26,7 +26,8 @@
             "Action": [
                 "ec2:DescribeInstances",
                 "ec2:DescribeImages",
-                "ec2:DescribeSubnets"
+                "ec2:DescribeSubnets",
+                "ec2:DescribeAddresses"
             ],
             "Resource": "*"
         },
@@ -60,13 +61,55 @@
             "Action": "ec2:CreateTags",
             "Resource": [
                 "arn:aws:ec2:*:ACCOUNT_ID:instance/*",
-                "arn:aws:ec2:*:ACCOUNT_ID:volume/*"
+                "arn:aws:ec2:*:ACCOUNT_ID:volume/*",
+                "arn:aws:ec2:*:ACCOUNT_ID:elastic-ip/*"
             ],
             "Condition": {
                 "StringEquals": {
-                    "ec2:CreateAction": "RunInstances"
+                    "ec2:CreateAction": [
+                        "RunInstances",
+                        "AllocateAddress"
+                    ]
                 }
             }
+        },
+        {
+            "Sid": "Ec2AllocateOnlyTaggedAddresses",
+            "Effect": "Allow",
+            "Action": "ec2:AllocateAddress",
+            "Resource": "arn:aws:ec2:*:ACCOUNT_ID:elastic-ip/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:RequestTag/dnslb:service": "SERVICE"
+                }
+            }
+        },
+        {
+            "Sid": "Ec2ManageOnlyOwnAddresses",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:AssociateAddress",
+                "ec2:DisassociateAddress",
+                "ec2:ReleaseAddress"
+            ],
+            "Resource": [
+                "arn:aws:ec2:*:ACCOUNT_ID:elastic-ip/*",
+                "arn:aws:ec2:*:ACCOUNT_ID:instance/*"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/dnslb:service": "SERVICE"
+                }
+            }
+        },
+        {
+            "Sid": "Ec2AddressNetworkInterfaces",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:AssociateAddress",
+                "ec2:DisassociateAddress"
+            ],
+            "Resource": "arn:aws:ec2:*:ACCOUNT_ID:network-interface/*"
         },
         {
             "Sid": "Ec2TerminateOnlyOwnInstances",

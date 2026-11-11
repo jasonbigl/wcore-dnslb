@@ -181,6 +181,9 @@ return [
                     'security_group_ids' => ['sg-0123456789abcdef0'],
                     'key_name' => 'ops',
                     'volume_size' => 20,
+                    // 为每台机器申请一个弹性 IP 并用它作为 DNS 记录（默认 false：使用 AWS 自动分配的公网 IP）。
+                    // 每个区域默认只有 5 个弹性 IP 配额，按 max 加上发布 / 替换时多出的台数申请提额；需要额外的 IAM 权限
+                    // 'elastic_ip' => true,
                 ],
             ],
         ],

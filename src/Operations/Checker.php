@@ -233,7 +233,13 @@ final class Checker
         if ($this->app->config()->dns->ipv6 && !$subnet['ipv6']) {
             throw new \RuntimeException("子网 {$spec->options['subnet_id']} 没有 IPv6 网段，但 dns.ipv6 已开启");
         }
-        return "AMI {$image['name']}，子网 {$subnet['id']}（{$subnet['az']}）";
+        $message = "AMI {$image['name']}，子网 {$subnet['id']}（{$subnet['az']}）";
+        if ($spec->elasticIp()) {
+            // 同时验证 ec2:DescribeAddresses 权限。配额查不到，只能给出已用数量供对照
+            $allocated = count($client->describeAddresses($spec->region));
+            $message .= "；弹性 IP：该区域已申请 {$allocated} 个（默认配额每区域 5 个，每台节点占 1 个，不够时先申请提额）";
+        }
+        return $message;
     }
 
     private function attempt(string $name, callable $check): void

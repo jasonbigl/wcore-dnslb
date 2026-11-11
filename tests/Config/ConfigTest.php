@@ -298,6 +298,28 @@ final class ConfigTest extends TestCase
         }
     }
 
+    public function testElasticIpIsAnEc2LaunchOptionThatDefaultsToOff(): void
+    {
+        $data = $this->minimal();
+        self::assertFalse(Config::fromArray($data, $this->templateDir())->pools['tokyo']->launch[0]->elasticIp());
+
+        $data['pools']['tokyo']['launch'][0]['elastic_ip'] = true;
+        $data['pools']['tokyo']['launch'][1] = ['provider' => 'linode', 'region' => 'ap-northeast', 'type' => 'g6-standard-2', 'image' => 'linode/debian12'];
+        $launch = Config::fromArray($data, $this->templateDir())->pools['tokyo']->launch;
+        self::assertTrue($launch[0]->elasticIp());
+        self::assertFalse($launch[1]->elasticIp(), 'Linode has no elastic IPs');
+
+        $data['pools']['tokyo']['launch'][0]['elastic_ip'] = 'yes';
+        $data['pools']['tokyo']['launch'][1]['elastic_ip'] = true;
+        try {
+            Config::fromArray($data, $this->templateDir());
+            self::fail('Expected ConfigException');
+        } catch (ConfigException $e) {
+            self::assertContains('pools.tokyo.launch.0.elastic_ip: must be true or false', $e->getErrors());
+            self::assertNotEmpty(preg_grep('/^pools\.tokyo\.launch\.1.*elastic_ip/', $e->getErrors()), 'not allowed on a Linode launch method');
+        }
+    }
+
     public function testUnknownTemplatePlaceholderIsReported(): void
     {
         $data = $this->minimal();

@@ -106,6 +106,35 @@ final class Ec2ClientTest extends TestCase
         self::assertSame('tok-2', $second['NextToken']);
     }
 
+    public function testAllocateAndDescribeAddresses(): void
+    {
+        $this->transport->queue(
+            new Response(200, [], '<AllocateAddressResponse xmlns="' . self::NS . '"><publicIp>203.0.113.10</publicIp><domain>vpc</domain>'
+                . '<allocationId>eipalloc-1</allocationId></AllocateAddressResponse>'),
+            new Response(200, [], '<DescribeAddressesResponse xmlns="' . self::NS . '"><addressesSet>'
+                . '<item><publicIp>203.0.113.10</publicIp><allocationId>eipalloc-1</allocationId><domain>vpc</domain><instanceId>i-1</instanceId>'
+                . '<associationId>eipassoc-1</associationId><tagSet><item><key>dnslb:node</key><value>web-tokyo-a</value></item></tagSet></item>'
+                . '<item><publicIp>203.0.113.11</publicIp><allocationId>eipalloc-2</allocationId><domain>vpc</domain></item>'
+                . '</addressesSet></DescribeAddressesResponse>')
+        );
+
+        self::assertSame(['id' => 'eipalloc-1', 'ip' => '203.0.113.10'], $this->client->allocateAddress('eu-central-1', [['Key' => 'dnslb:node', 'Value' => 'web-tokyo-a']]));
+        parse_str($this->transport->requests[0]->body, $allocate);
+        self::assertSame('AllocateAddress', $allocate['Action']);
+        self::assertSame('vpc', $allocate['Domain']);
+        self::assertSame('elastic-ip', $allocate['TagSpecification_1_ResourceType']);
+        self::assertSame('web-tokyo-a', $allocate['TagSpecification_1_Tag_1_Value']);
+
+        $addresses = $this->client->describeAddresses('eu-central-1', [['Name' => 'tag:dnslb:service', 'Value' => ['web']]], ['eipalloc-1', 'eipalloc-2']);
+        self::assertSame([
+            ['id' => 'eipalloc-1', 'ip' => '203.0.113.10', 'association_id' => 'eipassoc-1', 'instance_id' => 'i-1', 'tags' => ['dnslb:node' => 'web-tokyo-a']],
+            ['id' => 'eipalloc-2', 'ip' => '203.0.113.11', 'association_id' => null, 'instance_id' => null, 'tags' => []],
+        ], $addresses);
+        parse_str($this->transport->requests[1]->body, $describe);
+        self::assertSame('tag:dnslb:service', $describe['Filter_1_Name']);
+        self::assertSame('eipalloc-2', $describe['AllocationId_2']);
+    }
+
     public function testErrorParsing(): void
     {
         $this->transport->queue(new Response(400, [], '<?xml version="1.0"?><Response><Errors><Error>'

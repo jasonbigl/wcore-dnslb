@@ -17,7 +17,15 @@ final class OrphanTrackerTest extends TestCase
 
     protected function setUp(): void
     {
-        $this->t = new TestApp(['pools' => ['tokyo' => ['min' => 0], 'frankfurt' => ['min' => 0]]]);
+        $this->build(false);
+    }
+
+    /**
+     * @param bool $elasticIp tokyo 池的建机方式是否使用弹性 IP
+     */
+    private function build(bool $elasticIp): void
+    {
+        $this->t = new TestApp(['pools' => ['tokyo' => ['min' => 0, 'launch' => [['elastic_ip' => $elasticIp]]], 'frankfurt' => ['min' => 0]]]);
         $this->aws = new FakeProvider('aws');
         $this->t->app->providers()->set('aws', $this->aws);
 
@@ -159,6 +167,150 @@ final class OrphanTrackerTest extends TestCase
         self::assertSame(['i-dup', 'i-lost'], array_keys($result->skipped));
         self::assertStringContainsString('读不到 DNS 记录', $result->skipped['i-dup']);
         self::assertSame([], $this->aws->callsMatching('terminate'));
+        $this->t->app->lock('tick')->release();
+    }
+
+    public function testUnreferencedElasticIpsAreReportedOnceAfterTheGracePeriod(): void
+    {
+        $this->build(true);
+        // 存活节点名下的地址（包括多申请出来的一个）不算孤儿：节点结束时会一并释放
+        $this->aws->addAddress('eipalloc-a', '198.51.100.1', 'web-tokyo-a', 'i-a');
+        $this->aws->addAddress('eipalloc-a2', '198.51.100.2', 'web-tokyo-a');
+        $this->aws->addAddress('eipalloc-p', '198.51.100.3', 'web-tokyo-p');
+        // 节点已经不在了；以及没有节点标签的
+        $this->aws->addAddress('eipalloc-gone', '198.51.100.4', 'web-tokyo-gone');
+        $this->aws->addAddress('eipalloc-untagged', '198.51.100.5', null);
+        $tracker = $this->t->app->orphanTracker();
+
+        $tracker->track(true);
+        $this->t->clock->advance(899);
+        $tracker->track(true);
+        self::assertSame([], $tracker->confirmed());
+
+        $this->t->clock->advance(1);
+        $tracker->track(true);
+
+        $addresses = array_values(array_filter($tracker->confirmed(), static function (OrphanInstance $orphan): bool {
+            return $orphan->isAddress();
+        }));
+        self::assertSame(['eipalloc-gone', 'eipalloc-untagged'], self::ids($addresses));
+        self::assertSame('web-tokyo-gone', $addresses[0]->nodeId);
+        self::assertSame(['list-addresses ap-northeast-1'], array_values(array_unique($this->aws->callsMatching('list-addresses'))), 'only regions that use elastic IPs');
+        self::assertSame(2, count(array_keys($this->t->eventTypes(), 'orphan_address', true)));
+        $event = array_values(array_filter($this->t->app->events()->recent(10), static function ($event): bool {
+            return $event->type === 'orphan_address';
+        }))[0];
+        self::assertStringContainsString('弹性 IP eipalloc-', $event->message);
+        self::assertStringContainsString('Dnslb::cleanupOrphans()', $event->message);
+        self::assertSame('address', $event->context['kind']);
+
+        $this->t->clock->advance(600);
+        $tracker->track(true);
+        self::assertSame(2, count(array_keys($this->t->eventTypes(), 'orphan_address', true)), 'each address is reported once');
+
+        // 实例孤儿照常发现，两类记录互不影响
+        self::assertSame(['i-dup', 'i-lost'], self::ids(array_values(array_filter($tracker->confirmed(), static function (OrphanInstance $orphan): bool {
+            return !$orphan->isAddress();
+        }))));
+    }
+
+    public function testElasticIpListingFailureKeepsWhatWasFound(): void
+    {
+        $this->build(true);
+        $this->aws->addAddress('eipalloc-gone', '198.51.100.4', 'web-tokyo-gone');
+        $tracker = $this->t->app->orphanTracker();
+        $tracker->track(true);
+        $this->aws->listAddressesFails = true;
+        $this->t->clock->advance(900);
+        $tracker->track(true);
+
+        self::assertContains('eipalloc-gone', self::ids($tracker->confirmed()));
+        self::assertNotEmpty($this->t->logger->matching('Cannot list elastic IPs on aws to look for orphans'));
+
+        // 释放之后不再是孤儿
+        $this->aws->listAddressesFails = false;
+        unset($this->aws->addresses['eipalloc-gone']);
+        $tracker->track(true);
+        self::assertNotContains('eipalloc-gone', self::ids($tracker->confirmed()));
+    }
+
+    public function testElasticIpsAreNotListedUnlessTheyAreInUse(): void
+    {
+        $tracker = $this->t->app->orphanTracker();
+        $tracker->track(true);
+        self::assertSame([], $this->aws->callsMatching('list-addresses'), 'no elastic_ip in the config and no node uses one');
+
+        // 关掉开关之后，还在用弹性 IP 的节点所在区域仍然检查
+        $node = $this->t->node('web-tokyo-a');
+        $node->elasticIp = true;
+        $this->t->app->nodes()->save($node, $this->t->clock->now());
+        $tracker->track(true);
+        self::assertSame(['list-addresses x'], $this->aws->callsMatching('list-addresses'));
+    }
+
+    public function testCleanupReleasesOrphanAddresses(): void
+    {
+        $this->build(true);
+        // 未关联任何实例
+        $this->aws->addAddress('eipalloc-free', '198.51.100.4', 'web-tokyo-gone');
+        // 关联着本次要删除的孤儿实例 i-lost
+        $this->aws->addAddress('eipalloc-lost', '198.51.100.5', 'web-tokyo-lost', 'i-lost');
+        // 关联着别的机器
+        $this->aws->addAddress('eipalloc-busy', '198.51.100.6', 'web-tokyo-other', 'i-foreign');
+        $this->t->app->orphanTracker()->track(true);
+        $this->t->clock->advance(900);
+        $lb = $this->t->lb(['aws' => $this->aws]);
+
+        $preview = $lb->cleanupOrphans();
+        self::assertSame(['i-dup', 'i-lost', 'eipalloc-free', 'eipalloc-lost'], self::ids($preview->orphans));
+        self::assertSame(['eipalloc-busy'], array_keys($preview->skipped));
+        self::assertStringContainsString('仍关联着实例 i-foreign', $preview->skipped['eipalloc-busy']);
+        self::assertSame([], $this->aws->callsMatching('release-address'));
+        self::assertSame('address', $lb->status()['orphans'][2]['kind']);
+
+        $result = $lb->cleanupOrphans(false);
+        self::assertSame(['i-dup', 'i-lost', 'eipalloc-free', 'eipalloc-lost'], self::ids($result->terminated));
+        self::assertSame(['eipalloc-busy'], array_keys($result->skipped));
+        self::assertSame([], $result->failed);
+        self::assertSame(['release-address eipalloc-free', 'release-address eipalloc-lost detach'], $this->aws->callsMatching('release-address'));
+        self::assertSame(['eipalloc-busy'], array_keys($this->aws->addresses));
+        self::assertSame(['eipalloc-busy'], array_column($lb->status()['orphans'], 'instance_id'));
+        self::assertContains('orphan_address_released', $this->t->eventTypes());
+        $this->t->app->lock('tick')->release();
+    }
+
+    public function testCleanupKeepsAddressesWhoseNodeIsStillInDns(): void
+    {
+        $this->build(true);
+        $this->t->network->route53->add(RecordSet::multiValue('tokyo.pool.app.example.com', 'A', 'web-tokyo-lost', 60, ['198.51.100.5']));
+        $this->aws->addAddress('eipalloc-lost', '198.51.100.5', 'web-tokyo-lost', 'i-lost');
+        $this->t->app->orphanTracker()->track(true);
+        $this->t->clock->advance(900);
+        $lb = $this->t->lb(['aws' => $this->aws]);
+
+        $result = $lb->cleanupOrphans(false);
+
+        self::assertSame(['i-dup'], self::ids($result->terminated));
+        self::assertSame(['i-lost', 'eipalloc-lost'], array_keys($result->skipped));
+        self::assertStringContainsString('仍在 DNS 中', $result->skipped['eipalloc-lost']);
+        self::assertSame([], $this->aws->callsMatching('release-address'));
+        $this->t->app->lock('tick')->release();
+    }
+
+    public function testCleanupReportsAddressesThatCouldNotBeReleased(): void
+    {
+        $this->build(true);
+        $this->aws->addAddress('eipalloc-free', '198.51.100.4', 'web-tokyo-gone');
+        $this->t->app->orphanTracker()->track(true);
+        $this->t->clock->advance(900);
+        $this->aws->releaseFails = 'UnauthorizedOperation: not authorized';
+        $lb = $this->t->lb(['aws' => $this->aws]);
+
+        $result = $lb->cleanupOrphans(false);
+
+        self::assertSame(['eipalloc-free'], array_keys($result->failed));
+        self::assertStringContainsString('UnauthorizedOperation', $result->failed['eipalloc-free']);
+        self::assertContains('eipalloc-free', array_column($lb->status()['orphans'], 'instance_id'), 'still listed for the next run');
         $this->t->app->lock('tick')->release();
     }
 

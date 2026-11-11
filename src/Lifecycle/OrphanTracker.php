@@ -4,6 +4,7 @@ namespace Wcore\Dnslb\Lifecycle;
 
 use Wcore\Dnslb\Config\Config;
 use Wcore\Dnslb\Notify\EventRecorder;
+use Wcore\Dnslb\Provider\ElasticIpProvider;
 use Wcore\Dnslb\Provider\Instance;
 use Wcore\Dnslb\Provider\ProviderRegistry;
 use Wcore\Dnslb\State\Meta;
@@ -20,6 +21,8 @@ use Wcore\Dnslb\Support\Logger;
  *
  * 在所有建机区域（以及现有节点所在区域）列出实例，与状态库比对；连续 GRACE 秒没有节点引用才认定为孤儿，
  * 每台告警一次。不会自动删除（状态库从备份恢复时，正常节点也会被当成孤儿），由 Dnslb::cleanupOrphans() 确认后删除。
+ *
+ * 弹性 IP（launch 的 elastic_ip）用同样的办法巡检，见 trackAddresses()。
  */
 final class OrphanTracker
 {
@@ -102,8 +105,28 @@ final class OrphanTracker
             $this->orphans->replaceForProvider($provider, $suspects);
         }
 
+        $this->trackAddresses($nodes, $now);
+
         foreach ($this->confirmed() as $orphan) {
             if ($orphan->reportedAt !== null) {
+                continue;
+            }
+            if ($orphan->isAddress()) {
+                $this->events->warning(
+                    'orphan_address',
+                    sprintf(
+                        '弹性 IP %s（%s/%s）带有本服务的标签，但已超过 %d 分钟没有节点引用，仍在计费并占用配额。确认是本服务遗留的再用 Dnslb::cleanupOrphans() 释放；'
+                        . '如果同一云账号里有另一套部署使用了相同的服务名，这可能是它的地址，不要释放',
+                        $orphan->instanceId,
+                        $orphan->provider,
+                        $orphan->region,
+                        intdiv(self::GRACE, 60)
+                    ),
+                    null,
+                    $orphan->nodeId,
+                    $orphan->toArray()
+                );
+                $this->orphans->markReported($orphan, $now);
                 continue;
             }
             $this->events->warning(
@@ -122,6 +145,64 @@ final class OrphanTracker
             );
             $this->orphans->markReported($orphan, $now);
         }
+    }
+
+    /**
+     * 弹性 IP：节点结束时会释放自己名下的地址，但换建机方式、进程中途退出等情况下可能留下没人管的。
+     * 按节点标签比对：标签里的节点不是存活节点的就是可疑地址（存活节点名下多申请出来的，节点结束时会一并释放）。
+     * 只查用到弹性 IP 的区域，没有开启 elastic_ip 的部署不会调用这个接口。
+     *
+     * @param Node[] $nodes 存活节点
+     */
+    private function trackAddresses(array $nodes, int $now): void
+    {
+        $live = [];
+        foreach ($nodes as $node) {
+            $live[$node->nodeId] = true;
+        }
+        foreach ($this->addressRegions($nodes) as $provider => $regions) {
+            $impl = $this->providers->get($provider);
+            if (!$impl instanceof ElasticIpProvider) {
+                continue;
+            }
+            try {
+                $addresses = $impl->listAddresses($this->config->service, array_keys($regions));
+            } catch (\Throwable $e) {
+                // 列不出来时保留已有记录，下次再查
+                $this->logger->warning("Cannot list elastic IPs on {$provider} to look for orphans: {$e->getMessage()}");
+                continue;
+            }
+            $suspects = [];
+            foreach ($addresses as $address) {
+                if ($address->nodeId !== null && isset($live[$address->nodeId])) {
+                    continue;
+                }
+                $suspects[] = new OrphanInstance($provider, $address->id, $address->region, $address->nodeId, $now, OrphanInstance::KIND_ADDRESS);
+            }
+            $this->orphans->replaceForProvider($provider, $suspects, OrphanInstance::KIND_ADDRESS);
+        }
+    }
+
+    /**
+     * @param Node[] $nodes
+     * @return array<string,array<string,true>> 云厂商 => 区域：launch 配置了 elastic_ip 的区域，以及现有弹性 IP 节点所在区域
+     */
+    private function addressRegions(array $nodes): array
+    {
+        $regions = [];
+        foreach ($this->config->pools as $pool) {
+            foreach ($pool->launch as $spec) {
+                if ($spec->elasticIp()) {
+                    $regions[$spec->provider][$spec->region] = true;
+                }
+            }
+        }
+        foreach ($nodes as $node) {
+            if ($node->elasticIp && isset($this->config->providers[$node->provider])) {
+                $regions[$node->provider][$node->providerRegion] = true;
+            }
+        }
+        return $regions;
     }
 
     /**

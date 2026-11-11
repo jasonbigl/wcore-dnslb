@@ -53,7 +53,7 @@ final class LaunchSpec
         } else {
             $s->allowOnly([
                 'provider', 'region', 'weight', 'instance_type', 'ami', 'subnet_id', 'security_group_ids',
-                'key_name', 'volume_size', 'volume_type', 'iam_instance_profile', 'tags',
+                'key_name', 'volume_size', 'volume_type', 'iam_instance_profile', 'elastic_ip', 'tags',
             ]);
             if ($s->has('region') && !preg_match('/^[a-z]{2}(-gov)?-[a-z]+-\d+$/', $c->region)) {
                 $s->error('region', "invalid AWS region \"{$c->region}\"");
@@ -78,9 +78,18 @@ final class LaunchSpec
                 'volume_size' => $s->optionalInt('volume_size', 1, 16384),
                 'volume_type' => $s->optionalString('volume_type'),
                 'iam_instance_profile' => $s->optionalString('iam_instance_profile'),
+                'elastic_ip' => $s->bool('elastic_ip', false),
                 'tags' => $tags,
             ];
         }
         return $c;
+    }
+
+    /**
+     * 是否为每台机器申请弹性 IP 并用它作为公网 IPv4（仅 EC2）。
+     */
+    public function elasticIp(): bool
+    {
+        return !empty($this->options['elastic_ip']);
     }
 }

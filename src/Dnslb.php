@@ -219,6 +219,8 @@ final class Dnslb
      * 删除孤儿实例：云上带本服务标签、但连续 15 分钟没有节点引用的实例（tick 每 10 分钟检查一次并告警）。
      * 调用时会重新检查一次。默认只预览（$dryRun = true），确认列表后再传 false 删除。
      * 状态库从备份恢复后不要直接删除：备份之后创建的正常节点也会被当成孤儿，应先 rebuildState()。
+     *
+     * 没有节点引用的弹性 IP（launch 的 elastic_ip）同样在这里释放；仍关联着实例的，只有该实例也在本次删除时才释放。
      */
     public function cleanupOrphans(bool $dryRun = true): OrphanCleanupResult
     {

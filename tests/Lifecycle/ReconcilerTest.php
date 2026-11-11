@@ -597,6 +597,166 @@ final class ReconcilerTest extends TestCase
         );
     }
 
+    public function testElasticIpNodeGetsItsAddressFromTheTickWhenCreateCouldNotAssociateIt(): void
+    {
+        $this->t = $this->elasticApp();
+        $this->tick();
+
+        $id = $this->t->app->nodes()->liveInPool('tokyo')[0]->nodeId;
+        self::assertSame(["allocate {$id}"], $this->aws->callsMatching('allocate'));
+        self::assertTrue($this->node($id)->elasticIp);
+        self::assertNull($this->node($id)->ipv4);
+        self::assertStringContainsString('弹性 IP 等实例运行后关联', $this->t->app->events()->recent(1)[0]->message);
+
+        // 实例还在 pending：不能关联
+        $this->tick();
+        self::assertSame([], $this->aws->callsMatching('attach'));
+        self::assertSame(Node::BOOTING, $this->node($id)->state);
+
+        $this->aws->boot($id, null, '2001:db8::1');
+        $this->tick();
+
+        self::assertSame(["attach {$id}"], $this->aws->callsMatching('attach'));
+        self::assertSame(Node::WARMING, $this->node($id)->state);
+        self::assertSame('198.51.100.1', $this->node($id)->ipv4, 'the elastic IP is what gets published');
+        self::assertSame('i-1', $this->aws->addresses['eipalloc-1']->instanceId);
+    }
+
+    public function testElasticIpAssociatedDuringCreateNeedsNoFurtherCalls(): void
+    {
+        $this->t = $this->elasticApp();
+        $this->aws->attachOnCreate = true;
+        $this->tick();
+
+        $id = $this->t->app->nodes()->liveInPool('tokyo')[0]->nodeId;
+        self::assertSame('198.51.100.1', $this->node($id)->ipv4);
+        self::assertStringContainsString('弹性 IP 198.51.100.1', $this->t->app->events()->recent(1)[0]->message);
+
+        $this->aws->instanceOf($id)->ipv6 = '2001:db8::1';
+        $this->tick();
+
+        self::assertSame(Node::WARMING, $this->node($id)->state);
+        self::assertSame([], $this->aws->callsMatching('attach'));
+    }
+
+    public function testElasticIpThatCannotBeAssociatedEndsAsWarmupTimeoutAndIsReleased(): void
+    {
+        $this->t = $this->elasticApp();
+        $this->tick();
+        $id = $this->t->app->nodes()->liveInPool('tokyo')[0]->nodeId;
+        $this->aws->boot($id, null, '2001:db8::1');
+        $this->aws->attachFails = 'UnauthorizedOperation: not authorized';
+
+        $this->t->app->reconciler()->advanceNodes();
+        self::assertSame(Node::BOOTING, $this->node($id)->state);
+        self::assertStringContainsString('关联弹性 IP 失败：UnauthorizedOperation', (string) $this->node($id)->lastError);
+
+        $this->t->clock->advance($this->t->config->warmupTimeout + 1);
+        $this->t->app->reconciler()->advanceNodes();
+
+        self::assertSame(Node::TERMINATED, $this->node($id)->state);
+        self::assertSame([], $this->aws->addresses, 'released together with the instance');
+        $timeout = array_values(array_filter($this->t->app->events()->recent(10), static function ($event): bool {
+            return $event->type === 'warmup_timeout';
+        }))[0];
+        self::assertStringContainsString('等待弹性 IP 关联（关联弹性 IP 失败：UnauthorizedOperation', $timeout->message);
+    }
+
+    public function testElasticIpIsReleasedWhenTheNodeEndsAndTheReleaseIsRetriedUntilItWorks(): void
+    {
+        $this->t = $this->elasticApp();
+        $this->tick();
+        $node = $this->t->app->nodes()->liveInPool('tokyo')[0];
+        $id = $node->nodeId;
+        // 实例还在删除中，弹性 IP 暂时释放不了
+        $this->aws->releaseFails = 'InvalidIPAddress.InUse: Address is in use';
+
+        $this->t->app->reconciler()->cancel($node, '测试');
+
+        self::assertSame(Node::TERMINATING, $this->node($id)->state);
+        self::assertSame(Instance::GONE, $this->aws->instanceOf($id)->status);
+        self::assertStringContainsString('释放弹性 IP 失败：InvalidIPAddress.InUse', (string) $this->node($id)->lastError);
+        self::assertNotContains('node_terminated', $this->t->eventTypes());
+
+        // 一直释放不了：10 分钟后告警一次，之后继续重试
+        for ($i = 0; $i < 12; $i++) {
+            $this->t->clock->advance(60);
+            $this->t->app->reconciler()->advanceNodes();
+        }
+        self::assertSame(Node::TERMINATING, $this->node($id)->state);
+        self::assertCount(1, array_keys($this->t->eventTypes(), 'address_release_failed', true));
+        self::assertCount(13, $this->aws->callsMatching("release {$id}"));
+
+        $this->aws->releaseFails = null;
+        $this->t->clock->advance(60);
+        $this->t->app->reconciler()->advanceNodes();
+
+        self::assertSame(Node::TERMINATED, $this->node($id)->state);
+        self::assertSame([], $this->aws->addresses);
+        self::assertStringContainsString('弹性 IP 已释放', $this->t->app->events()->recent(1)[0]->message);
+    }
+
+    public function testDrainingElasticIpNodeWhoseInstanceVanishedStillReleasesItsAddress(): void
+    {
+        [$id] = $this->serving(1);
+        $node = $this->node($id);
+        $node->elasticIp = true;
+        $node->transition(Node::DRAINING, $this->t->clock->now());
+        $this->t->app->nodes()->save($node, $this->t->clock->now());
+        $this->aws->addAddress('eipalloc-s0', '198.51.100.9', $id, 'i-s0');
+        $this->aws->instances['i-s0']->status = Instance::GONE;
+
+        $this->t->app->reconciler()->advanceNodes();
+
+        self::assertSame(Node::TERMINATED, $this->node($id)->state);
+        self::assertSame([], $this->aws->addresses);
+        self::assertSame([], $this->aws->callsMatching('terminate'), 'the instance is already gone');
+        self::assertSame('实例已不存在，排空结束，弹性 IP 已释放', $this->t->app->events()->recent(1)[0]->message);
+    }
+
+    public function testSwitchingLaunchMethodAfterAnUnknownOutcomeReleasesTheAddressLeftBehind(): void
+    {
+        $this->t = $this->elasticApp();
+        $this->aws->unknownCreate = 'RequestLimitExceeded';
+        $this->tick();
+        $id = $this->t->app->nodes()->liveInPool('tokyo')[0]->nodeId;
+        // 结果未知的那次请求其实已经申请了弹性 IP
+        $this->aws->addAddress('eipalloc-x', '198.51.100.9', $id);
+
+        $this->tick();
+        self::assertSame('aws', $this->node($id)->provider, 'same method is retried first');
+        self::assertArrayHasKey('eipalloc-x', $this->aws->addresses);
+        $this->tick();
+
+        self::assertSame('backup', $this->node($id)->provider);
+        self::assertSame([], $this->aws->addresses);
+        self::assertFalse($this->node($id)->elasticIp, 'the next launch method does not use one');
+    }
+
+    public function testNodesWithoutAnElasticIpNeverCallTheAddressApi(): void
+    {
+        $this->tick();
+        $nodes = $this->t->app->nodes()->liveInPool('tokyo');
+        $this->aws->boot($nodes[0]->nodeId, '10.0.0.1', '2001:db8::1');
+        $this->tick();
+        $this->t->app->reconciler()->cancel($this->node($nodes[0]->nodeId), '测试');
+        $this->t->app->reconciler()->cancel($this->node($nodes[1]->nodeId), '测试');
+        $this->t->app->orphanTracker()->track(true);
+
+        self::assertSame(Node::TERMINATED, $this->node($nodes[0]->nodeId)->state);
+        foreach (['allocate', 'attach', 'release', 'list-addresses'] as $call) {
+            self::assertSame([], $this->aws->callsMatching($call), "{$call} needs IAM permissions that deployments without elastic_ip do not have");
+        }
+    }
+
+    /**
+     * tokyo 池的首选建机方式使用弹性 IP，只建 1 台。
+     */
+    private function elasticApp(): TestApp
+    {
+        return $this->app(['pools' => ['tokyo' => ['min' => 1, 'launch' => [['elastic_ip' => true]]]]]);
+    }
+
     private function app(array $overrides = [], ?string $consoleDir = null): TestApp
     {
         $t = new TestApp(array_replace_recursive([

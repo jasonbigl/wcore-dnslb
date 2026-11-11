@@ -5,7 +5,10 @@ namespace Wcore\Dnslb\Operations;
 use Wcore\Dnslb\Application;
 use Wcore\Dnslb\Config\PoolConfig;
 use Wcore\Dnslb\Lifecycle\Reconciler;
+use Wcore\Dnslb\Provider\Address;
+use Wcore\Dnslb\Provider\ElasticIpProvider;
 use Wcore\Dnslb\State\Node;
+use Wcore\Dnslb\State\OrphanInstance;
 
 /**
  * 手动操作节点。调用方（Dnslb）负责持有 tick 锁，保证不与 tick 并发。
@@ -113,6 +116,9 @@ final class NodeOperations
      * 状态库丢失或从备份恢复时，正在服务的机器也会被当成孤儿：节点 ID 仍在 DNS 中、而状态库里没有这个在线节点的
      * 实例一律跳过（删除会让用户访问失败，并释放仍被解析到的 IP）。状态库里有同 ID 的在线节点时，DNS 中的记录属于那台，
      * 孤儿是换建机方式时多建的一台，照常删除。读不到 DNS 记录时全部跳过。
+     *
+     * 孤儿弹性 IP 在实例之后处理，受同样的 DNS 保护。没有关联实例的直接释放；仍关联着实例的，只有它所属节点的
+     * 孤儿实例也在本次删除时才一并释放，否则跳过（不动别的机器正在用的地址）。
      */
     public function cleanupOrphans(): OrphanCleanupResult
     {
@@ -123,6 +129,13 @@ final class NodeOperations
         if ($confirmed === []) {
             return $result;
         }
+        // 先实例、后弹性 IP
+        usort($confirmed, static function (OrphanInstance $a, OrphanInstance $b): int {
+            return [$a->isAddress(), $a->firstSeenAt, $a->instanceId] <=> [$b->isAddress(), $b->firstSeenAt, $b->instanceId];
+        });
+        $addresses = $this->orphanAddresses($confirmed);
+        /** @var array<string,true> 本次删除（预览时为将要删除）的孤儿实例的节点 ID */
+        $removedNodes = [];
         $unreadable = null;
         try {
             $published = $this->app->dnsSync()->publishedNodeIds();
@@ -144,8 +157,15 @@ final class NodeOperations
                 $result->skipped[$orphan->instanceId] = "节点 {$orphan->nodeId} 仍在 DNS 中，可能正在服务（状态库丢失或从备份恢复？），先运行 rebuildState()";
                 continue;
             }
+            if ($orphan->isAddress()) {
+                $this->cleanupOrphanAddress($orphan, $addresses, $removedNodes, $result);
+                continue;
+            }
             $result->orphans[] = $orphan;
             if ($result->dryRun) {
+                if ($orphan->nodeId !== null) {
+                    $removedNodes[$orphan->nodeId] = true;
+                }
                 continue;
             }
             try {
@@ -153,6 +173,9 @@ final class NodeOperations
             } catch (\Throwable $e) {
                 $result->failed[$orphan->instanceId] = $e->getMessage();
                 continue;
+            }
+            if ($orphan->nodeId !== null) {
+                $removedNodes[$orphan->nodeId] = true;
             }
             $tracker->forget($orphan);
             $result->terminated[] = $orphan;
@@ -162,6 +185,92 @@ final class NodeOperations
                 null,
                 $orphan->nodeId
             );
+        }
+        return $result;
+    }
+
+    /**
+     * 释放一个孤儿弹性 IP（已通过 DNS 检查）。
+     *
+     * @param array<string,array<string,Address>|null> $addresses 见 orphanAddresses()
+     * @param array<string,true> $removedNodes 本次删除了孤儿实例的节点 ID
+     */
+    private function cleanupOrphanAddress(OrphanInstance $orphan, array $addresses, array $removedNodes, OrphanCleanupResult $result): void
+    {
+        $tracker = $this->app->orphanTracker();
+        $current = $addresses[$orphan->provider] ?? null;
+        if ($current === null) {
+            $result->skipped[$orphan->instanceId] = '查不到弹性 IP 的当前状态，无法确认是否仍在使用';
+            return;
+        }
+        $address = $current[$orphan->instanceId] ?? null;
+        if ($address === null) {
+            // 已经被释放
+            if (!$result->dryRun) {
+                $tracker->forget($orphan);
+            }
+            return;
+        }
+        // 仍关联着实例：只有这台实例是本次删除的孤儿时才解除关联并释放
+        $detach = $orphan->nodeId !== null && isset($removedNodes[$orphan->nodeId]);
+        if ($address->instanceId !== null && !$detach) {
+            $result->skipped[$orphan->instanceId] = "弹性 IP {$address->ip} 仍关联着实例 {$address->instanceId}，不释放；该实例删除后再运行一次";
+            return;
+        }
+        $result->orphans[] = $orphan;
+        if ($result->dryRun) {
+            return;
+        }
+        try {
+            $provider = $this->app->providers()->get($orphan->provider);
+            if (!$provider instanceof ElasticIpProvider) {
+                throw new OperationException("Provider {$orphan->provider} does not manage elastic IPs");
+            }
+            $provider->releaseAddress($orphan->region, $orphan->instanceId, $detach);
+        } catch (\Throwable $e) {
+            $result->failed[$orphan->instanceId] = $e->getMessage();
+            return;
+        }
+        $tracker->forget($orphan);
+        $result->terminated[] = $orphan;
+        $this->app->eventRecorder()->info(
+            'orphan_address_released',
+            "已释放孤儿弹性 IP {$address->ip}（{$orphan->instanceId}，{$orphan->provider}/{$orphan->region}）",
+            null,
+            $orphan->nodeId
+        );
+    }
+
+    /**
+     * 孤儿弹性 IP 的当前状态（是否仍关联着实例）。
+     *
+     * @param OrphanInstance[] $orphans
+     * @return array<string,array<string,Address>|null> 云厂商 => 地址 ID => 地址；null 表示查询失败
+     */
+    private function orphanAddresses(array $orphans): array
+    {
+        $regions = [];
+        foreach ($orphans as $orphan) {
+            if ($orphan->isAddress()) {
+                $regions[$orphan->provider][$orphan->region] = true;
+            }
+        }
+        $result = [];
+        foreach ($regions as $name => $providerRegions) {
+            $result[$name] = null;
+            try {
+                $provider = $this->app->providers()->get($name);
+                if (!$provider instanceof ElasticIpProvider) {
+                    continue;
+                }
+                $result[$name] = [];
+                foreach ($provider->listAddresses($this->app->config()->service, array_keys($providerRegions)) as $address) {
+                    $result[$name][$address->id] = $address;
+                }
+            } catch (\Throwable $e) {
+                $result[$name] = null;
+                $this->app->logger()->warning("Cannot list elastic IPs on {$name}: {$e->getMessage()}");
+            }
         }
         return $result;
     }

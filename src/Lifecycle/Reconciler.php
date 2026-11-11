@@ -10,6 +10,7 @@ use Wcore\Dnslb\Metrics\MetricException;
 use Wcore\Dnslb\Metrics\MetricRegistry;
 use Wcore\Dnslb\Notify\EventRecorder;
 use Wcore\Dnslb\Provider\ConsoleOutputProvider;
+use Wcore\Dnslb\Provider\ElasticIpProvider;
 use Wcore\Dnslb\Provider\Instance;
 use Wcore\Dnslb\Provider\ProviderRegistry;
 use Wcore\Dnslb\State\Node;
@@ -274,6 +275,12 @@ final class Reconciler
         $unknownFor = $now - ($node->launchStartedAt ?? $node->createdAt);
         if ($unknownFor >= self::UNKNOWN_FALLBACK_AFTER && $from + 1 < count($pool->launch)) {
             $this->logger->warning("Launch of {$node->nodeId} via {$node->provider}/{$node->providerRegion} still unknown after {$unknownFor}s and no instance found; trying the next launch method");
+            // 这种方式可能已经申请了弹性 IP，换到别的区域后就没人释放它了。失败时留给孤儿巡检
+            try {
+                $this->releaseAddresses($node);
+            } catch (\Throwable $e) {
+                $this->logger->warning("Cannot release the elastic IP of {$node->nodeId} in {$node->providerRegion}: {$e->getMessage()}");
+            }
             $from++;
         }
         $this->provisioner->launch($node, $pool, $from);
@@ -297,7 +304,11 @@ final class Reconciler
             return;
         }
 
-        $changed = self::updateAddresses($node, $instance);
+        $changed = false;
+        if ($node->elasticIp && $instance->status === Instance::RUNNING && $instance->ipv4 === null) {
+            $changed = $this->attachAddress($node, $instance);
+        }
+        $changed = self::updateAddresses($node, $instance) || $changed;
         if ($instance->status === Instance::RUNNING && $node->ipv4 !== null && (!$this->config->dns->ipv6 || $node->ipv6 !== null)) {
             $node->transition(Node::WARMING, $now);
             $this->nodes->save($node, $now);
@@ -305,13 +316,43 @@ final class Reconciler
             return;
         }
         if ($now - $node->createdAt > $this->config->warmupTimeout) {
-            $waiting = $node->ipv4 === null ? '公网 IPv4 地址' : ($this->config->dns->ipv6 && $node->ipv6 === null ? 'IPv6 地址（子网是否已启用 IPv6？）' : '实例启动');
+            $ipv4 = $node->elasticIp ? '弹性 IP 关联' . ($node->lastError !== null ? "（{$node->lastError}）" : '') : '公网 IPv4 地址';
+            $waiting = $node->ipv4 === null ? $ipv4 : ($this->config->dns->ipv6 && $node->ipv6 === null ? 'IPv6 地址（子网是否已启用 IPv6？）' : '实例启动');
             $this->warmupFailed($node, "等待{$waiting}超时");
             return;
         }
         if ($changed) {
             $this->nodes->save($node, $now);
         }
+    }
+
+    /**
+     * 建机时没来得及关联弹性 IP（实例迟迟没有 running、请求失败或进程中途退出）：实例 running 后在这里补上。
+     * 失败只记录，下个 tick 再试；一直关联不上时按预热超时处理。
+     *
+     * @return bool 节点是否有需要保存的修改
+     */
+    private function attachAddress(Node $node, Instance $instance): bool
+    {
+        $provider = $this->providers->get($node->provider);
+        if (!$provider instanceof ElasticIpProvider) {
+            return false;
+        }
+        try {
+            $ip = $provider->attachAddress($node->providerRegion, $node->nodeId, $instance->id);
+        } catch (\Throwable $e) {
+            $node->lastError = "关联弹性 IP 失败：{$e->getMessage()}";
+            $this->logger->warning("Cannot associate the elastic IP of {$node->nodeId}: {$e->getMessage()}");
+            return true;
+        }
+        if ($ip === null) {
+            $this->logger->debug("No elastic IP to associate with {$node->nodeId}");
+            return false;
+        }
+        $instance->ipv4 = $ip;
+        $node->lastError = null;
+        $this->logger->info("Associated elastic IP {$ip} with {$node->nodeId}");
+        return true;
     }
 
     private function advanceWarming(Node $node): void
@@ -442,9 +483,7 @@ final class Reconciler
         $now = $this->clock->now();
         [$known, $instance] = $this->lookup($node);
         if ($known && ($instance === null || $instance->status === Instance::GONE) && $now - $node->createdAt > self::MISSING_GRACE) {
-            $node->transition(Node::TERMINATED, $now);
-            $this->nodes->save($node, $now);
-            $this->events->info('node_terminated', '实例已不存在，排空结束', $node->pool, $node->nodeId);
+            $this->terminate($node, true);
             return;
         }
         // 每个 tick 都确认节点已不在 DNS 中：DNS 同步失败时节点可能仍在解析结果中，排空期间记录也可能被外部加回
@@ -481,30 +520,85 @@ final class Reconciler
      *
      * 还没有实例 ID 时按节点 ID 查找；建机结果未知时实例可能刚建出、暂时查不到（EC2 最终一致性），
      * 所以进入 TERMINATING 后 MISSING_GRACE 秒内查不到都保持 TERMINATING，下次 tick 再查。
+     *
+     * 使用弹性 IP 的节点还要释放它（实例删除后弹性 IP 不会自动释放，仍然计费并占用配额），释放成功才算结束。
+     *
+     * @param bool $instanceGone 已确认实例不存在，不需要再删除
      */
-    private function terminate(Node $node): void
+    private function terminate(Node $node, bool $instanceGone = false): void
     {
         $now = $this->clock->now();
         if ($node->state !== Node::TERMINATING) {
             $node->transition(Node::TERMINATING, $now);
             $this->nodes->save($node, $now);
         }
-        $provider = $this->providers->get($node->provider);
-        $instanceId = $node->instanceId;
-        if ($instanceId === null) {
-            $found = $provider->findByNodeId($node->providerRegion, $node->nodeId);
-            $instanceId = $found === null ? null : $found->id;
-            if ($instanceId === null && $node->stateAge($now) < self::MISSING_GRACE) {
-                $this->logger->debug("No instance found for {$node->nodeId} yet; checking again before marking it terminated");
-                return;
+        $instanceId = null;
+        if (!$instanceGone) {
+            $provider = $this->providers->get($node->provider);
+            $instanceId = $node->instanceId;
+            if ($instanceId === null) {
+                $found = $provider->findByNodeId($node->providerRegion, $node->nodeId);
+                $instanceId = $found === null ? null : $found->id;
+                if ($instanceId === null && $node->stateAge($now) < self::MISSING_GRACE) {
+                    $this->logger->debug("No instance found for {$node->nodeId} yet; checking again before marking it terminated");
+                    return;
+                }
+            }
+            if ($instanceId !== null) {
+                $provider->terminate($node->providerRegion, $instanceId);
             }
         }
-        if ($instanceId !== null) {
-            $provider->terminate($node->providerRegion, $instanceId);
+        try {
+            $this->releaseAddresses($node);
+        } catch (\Throwable $e) {
+            $this->releaseFailed($node, $e->getMessage());
+            return;
         }
         $node->transition(Node::TERMINATED, $this->clock->now());
         $this->nodes->save($node, $this->clock->now());
-        $this->events->info('node_terminated', $instanceId === null ? '节点已结束（没有实例需要删除）' : "已删除实例 {$instanceId}", $node->pool, $node->nodeId);
+        if ($instanceGone) {
+            $message = '实例已不存在，排空结束';
+        } else {
+            $message = $instanceId === null ? '节点已结束（没有实例需要删除）' : "已删除实例 {$instanceId}";
+        }
+        $this->events->info('node_terminated', $message . ($node->elasticIp ? '，弹性 IP 已释放' : ''), $node->pool, $node->nodeId);
+    }
+
+    /**
+     * 释放节点名下的弹性 IP。没有使用弹性 IP 的节点不调用云厂商接口（不需要相应的 IAM 权限）。
+     */
+    private function releaseAddresses(Node $node): void
+    {
+        if (!$node->elasticIp) {
+            return;
+        }
+        $provider = $this->providers->get($node->provider);
+        if ($provider instanceof ElasticIpProvider) {
+            $provider->releaseAddresses($node->providerRegion, $node->nodeId);
+        }
+    }
+
+    /**
+     * 弹性 IP 暂时释放不了（例如实例还在删除中）：保持 TERMINATING，下个 tick 重试。
+     * 超过 MISSING_GRACE 仍释放不了时告警一次（多半是 IAM 权限不足），之后继续重试。
+     */
+    private function releaseFailed(Node $node, string $error): void
+    {
+        $now = $this->clock->now();
+        $alertAt = $node->stateChangedAt + self::MISSING_GRACE;
+        // 每次失败都会保存节点，所以 updatedAt 是上一次尝试的时间：只在第一次越过 $alertAt 时告警
+        $alert = $now >= $alertAt && $node->updatedAt < $alertAt;
+        $node->lastError = "释放弹性 IP 失败：{$error}";
+        $this->nodes->save($node, $now);
+        $this->logger->warning("Cannot release the elastic IP of {$node->nodeId}, retrying next tick: {$error}");
+        if ($alert) {
+            $this->events->warning(
+                'address_release_failed',
+                "实例已删除，但弹性 IP 一直释放不了，仍在计费并占用配额：{$error}。请检查 IAM 权限（ec2:DescribeAddresses、ec2:DisassociateAddress、ec2:ReleaseAddress），修复后会自动重试",
+                $node->pool,
+                $node->nodeId
+            );
+        }
     }
 
     /**

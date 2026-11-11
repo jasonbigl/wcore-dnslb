@@ -11,6 +11,8 @@ use Wcore\Dnslb\State\EventRepository;
 use Wcore\Dnslb\State\Meta;
 use Wcore\Dnslb\State\Node;
 use Wcore\Dnslb\State\NodeRepository;
+use Wcore\Dnslb\State\OrphanInstance;
+use Wcore\Dnslb\State\OrphanRepository;
 use Wcore\Dnslb\State\PoolRepository;
 use Wcore\Dnslb\State\PoolState;
 use Wcore\Dnslb\State\Schema;
@@ -136,6 +138,42 @@ final class StateTest extends TestCase
         }
     }
 
+    public function testUpgradeFromVersionTwoAddsElasticIpColumns(): void
+    {
+        $path = sys_get_temp_dir() . '/dnslb-upgrade-' . bin2hex(random_bytes(4)) . '.sqlite';
+        try {
+            $pdo = new \PDO('sqlite:' . $path);
+            foreach (array_slice(Schema::migrations(), 0, 2) as $statements) {
+                foreach ($statements as $sql) {
+                    $pdo->exec($sql);
+                }
+            }
+            $pdo->exec('PRAGMA user_version = 2');
+            $pdo->exec("INSERT INTO nodes (node_id, pool, state, provider, provider_region, launch_index, weight, created_at, updated_at, state_changed_at)
+                VALUES ('web-tokyo-old', 'tokyo', 'in_service', 'aws', 'x', 0, 10, 1, 1, 1)");
+            $pdo->exec("INSERT INTO orphans (provider, instance_id, region, node_id, first_seen_at) VALUES ('aws', 'i-old', 'x', NULL, 1)");
+            unset($pdo);
+
+            $db = Database::open($path);
+
+            self::assertSame(3, $db->schemaVersion());
+            self::assertFalse((new NodeRepository($db))->find('web-tokyo-old')->elasticIp, 'existing nodes keep their automatic public IP');
+            $orphans = new OrphanRepository($db);
+            self::assertFalse($orphans->all()[0]->isAddress());
+
+            // 两类记录分开更新：刷新弹性 IP 不会删掉实例的记录
+            $orphans->replaceForProvider('aws', [new OrphanInstance('aws', 'eipalloc-1', 'x', 'web-tokyo-gone', 5, OrphanInstance::KIND_ADDRESS)], OrphanInstance::KIND_ADDRESS);
+            $orphans->replaceForProvider('aws', [], OrphanInstance::KIND_INSTANCE);
+            self::assertCount(1, $orphans->all());
+            self::assertTrue($orphans->all()[0]->isAddress());
+            self::assertSame('address', $orphans->all()[0]->toArray()['kind']);
+        } finally {
+            foreach (glob($path . '*') ?: [] as $file) {
+                unlink($file);
+            }
+        }
+    }
+
     public function testNodeIsSettlingForTheConfiguredPeriodAfterGoingInService(): void
     {
         $node = new Node('web-tokyo-aaaaaa', 'tokyo', 'aws', 'x', 0, 10, 100);
@@ -165,6 +203,7 @@ final class StateTest extends TestCase
         $node->probedAt = 1150;
         $node->replacementFor = 'web-tokyo-zzzzzz';
         $node->inServiceAt = 1180;
+        $node->elasticIp = true;
         $repo->save($node, 1200);
         $repo->saveHealth($node);
 
@@ -181,6 +220,7 @@ final class StateTest extends TestCase
         self::assertSame('connect timeout', $loaded->v6->error);
         self::assertSame('web-tokyo-zzzzzz', $loaded->replacementFor);
         self::assertSame(1180, $loaded->inServiceAt);
+        self::assertTrue($loaded->elasticIp);
         self::assertSame(1000, $loaded->createdAt);
         self::assertSame(1100, $loaded->stateChangedAt);
         self::assertSame(1200, $loaded->updatedAt);

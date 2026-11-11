@@ -79,6 +79,8 @@ final class Provisioner
             $node->providerRegion = $spec->region;
             $node->launchIndex = $i;
             $node->weight = $spec->weight;
+            // 建机前就记下是否使用弹性 IP：请求结果未知或进程中途退出时，弹性 IP 可能已经申请，节点结束时要释放
+            $node->elasticIp = $spec->elasticIp();
             // 进程在保存建机结果前退出时，恢复流程按这里保存的方式查找实例，不会在别处重复建机
             $this->nodes->save($node, $this->clock->now());
 
@@ -108,6 +110,9 @@ final class Provisioner
 
             $this->adopt($node, $instance);
             $message = "创建实例 {$spec->provider}/{$spec->region}（{$instance->id}）";
+            if ($instance->elasticIp) {
+                $message .= $instance->ipv4 !== null ? "，弹性 IP {$instance->ipv4}" : '，弹性 IP 等实例运行后关联';
+            }
             if ($errors !== []) {
                 $message .= '，前面的方式失败：' . implode('；', $errors);
             }
@@ -129,6 +134,8 @@ final class Provisioner
         $node->instanceId = $instance->id;
         $node->ipv4 = $instance->ipv4;
         $node->ipv6 = $instance->ipv6;
+        // 实例带弹性 IP 标记时以它为准（例如建机后改了配置，再找回之前建出的实例）
+        $node->elasticIp = $node->elasticIp || $instance->elasticIp;
         $node->lastError = null;
         $node->transition(Node::BOOTING, $now);
         $this->nodes->save($node, $now);

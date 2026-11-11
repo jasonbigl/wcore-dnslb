@@ -96,7 +96,8 @@ final class StateRebuilder
         $node->instanceId = $instance->id;
         $node->ipv4 = $instance->ipv4;
         $node->ipv6 = $instance->ipv6;
-        $serving = $inDns && $instance->status === Instance::RUNNING && isset($config->pools[$pool]);
+        $node->elasticIp = $instance->elasticIp;
+        $serving =$inDns && $instance->status === Instance::RUNNING && isset($config->pools[$pool]);
         if (!$inDns) {
             $result->warnings[] = "实例 {$instance->provider}/{$instance->id}（{$nodeId}）不在 {$config->dns->nameList()} 的 DNS 记录中，按排空处理（drain.max 后删除）；"
                 . '如果同一云账号里有另一套部署使用了相同的服务名，这可能是它的机器';

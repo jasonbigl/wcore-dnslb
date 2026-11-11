@@ -26,6 +26,8 @@ final class Instance
     /** @var array<string,string> */
     public array $tags;
     public ?int $createdAt;
+    /** 公网 IPv4 是否使用单独申请的弹性 IP（见 ElasticIpProvider），节点结束时需要释放 */
+    public bool $elasticIp = false;
 
     /**
      * @param array<string,string> $tags

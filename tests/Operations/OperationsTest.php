@@ -289,6 +289,8 @@ final class OperationsTest extends TestCase
             ], 1600000000);
         }
         $this->aws->instances['i-x'] = new Instance('aws', 'i-x', 'ap-northeast-1', Instance::RUNNING, '10.0.0.9', null, null);
+        // 这台实例建机时使用了弹性 IP
+        $this->aws->instances['i-b']->elasticIp = true;
 
         $result = $this->lb->rebuildState();
 
@@ -305,6 +307,8 @@ final class OperationsTest extends TestCase
         self::assertSame('i-a', $a->instanceId);
         self::assertTrue($a->v4->healthy);
         self::assertSame(1600000000, $a->createdAt);
+        self::assertFalse($a->elasticIp);
+        self::assertTrue($this->t->node('web-tokyo-b')->elasticIp, 'its elastic IP is released when the node ends');
         self::assertSame(Node::DRAINING, $this->t->node('web-tokyo-c')->state, 'not in DNS: drained');
         $event = $this->t->app->events()->recent(1)[0];
         self::assertSame('state_rebuilt', $event->type);

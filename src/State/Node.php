@@ -36,6 +36,8 @@ final class Node
     public ?string $instanceId = null;
     public ?string $ipv4 = null;
     public ?string $ipv6 = null;
+    /** 公网 IPv4 是否使用弹性 IP（launch 的 elastic_ip）：节点结束时要释放它名下的弹性 IP */
+    public bool $elasticIp = false;
     public FamilyHealth $v4;
     public FamilyHealth $v6;
     public ?int $probedAt = null;
@@ -137,6 +139,7 @@ final class Node
         $node->instanceId = $row['instance_id'];
         $node->ipv4 = $row['ipv4'];
         $node->ipv6 = $row['ipv6'];
+        $node->elasticIp = (bool) ($row['elastic_ip'] ?? 0);
         foreach ([self::FAMILY_V4 => $node->v4, self::FAMILY_V6 => $node->v6] as $family => $health) {
             $health->healthy = (bool) $row["{$family}_healthy"];
             $health->fails = (int) $row["{$family}_fails"];
@@ -171,6 +174,7 @@ final class Node
             'instance_id' => $this->instanceId,
             'ipv4' => $this->ipv4,
             'ipv6' => $this->ipv6,
+            'elastic_ip' => $this->elasticIp ? 1 : 0,
         ];
         foreach ([self::FAMILY_V4 => $this->v4, self::FAMILY_V6 => $this->v6] as $family => $health) {
             $row["{$family}_healthy"] = $health->healthy ? 1 : 0;

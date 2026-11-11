@@ -101,6 +101,12 @@ final class Schema
                 // 节点上线时间（scaling.settle 使用）；升级前已在线的节点为 NULL，按已过稳定期处理
                 'ALTER TABLE nodes ADD COLUMN in_service_at INTEGER',
             ],
+            [
+                // 节点是否使用弹性 IP（launch 的 elastic_ip）：为 1 的节点结束时要释放它名下的弹性 IP
+                'ALTER TABLE nodes ADD COLUMN elastic_ip INTEGER NOT NULL DEFAULT 0',
+                // 孤儿巡检的对象：instance（实例）或 address（弹性 IP，此时 instance_id 列存 allocation ID）
+                "ALTER TABLE orphans ADD COLUMN kind TEXT NOT NULL DEFAULT 'instance'",
+            ],
         ];
     }
 }

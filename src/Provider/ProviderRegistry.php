@@ -96,6 +96,6 @@ final class ProviderRegistry
         if ($config->driver === ProviderConfig::DRIVER_LINODE) {
             return new LinodeProvider($name, $this->linodeClient($name));
         }
-        return new Ec2Provider($name, $this->ec2Client(), $this->config->dns->ipv6);
+        return new Ec2Provider($name, $this->ec2Client(), $this->config->dns->ipv6, $this->clock);
     }
 }
